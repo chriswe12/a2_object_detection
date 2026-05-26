@@ -1,18 +1,23 @@
 # Base ----------------------------------------
-matplotlib
-numpy
-opencv-python
-pillow
-PyYAML
-requests
-scipy
-tqdm
-# detection
-yolov5
-onnxruntime
+matplotlib==3.10.9
+numpy==1.26.4
+opencv-python==4.11.0.86
+opencv-python-headless==4.10.0.84
+pillow==12.2.0
+pillow-avif-plugin==1.5.5
+PyYAML==6.0.1
+requests==2.34.2
+requests-toolbelt==1.0.0
+scipy==1.17.1
+tqdm==4.67.3
+
+# detection -----------------------------------
+yolov5==7.0.14
+onnxruntime==1.26.0
 # Logging -------------------------------------
-tensorboard
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
 # Plotting ------------------------------------
-pandas
-seaborn
-hdbscan
+pandas==3.0.3
+seaborn==0.13.2
+hdbscan==0.8.43
