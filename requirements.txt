@@ -1,27 +1,18 @@
-
-# pip3 install torch==1.10.1+cpu torchvision==0.11.2+cpu torchaudio==0.10.1+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
-
-# pip install -r requirements.txt
-
 # Base ----------------------------------------
-matplotlib==3.7.5
-numpy==1.23.5
-opencv-python==4.10.0.84
-pillow==10.4.0
-PyYAML==5.3.1
-requests==2.32.4
-scipy==1.10.1
-tqdm==4.67.1
-
-
+matplotlib
+numpy
+opencv-python
+pillow
+PyYAML
+requests
+scipy
+tqdm
 # detection
-yolov5==7.0.14
-
+yolov5
+onnxruntime
 # Logging -------------------------------------
-tensorboard==2.14.0
-
+tensorboard
 # Plotting ------------------------------------
-pandas==2.0.3
-seaborn==0.13.2
-
-hdbscan==0.8.40
+pandas
+seaborn
+hdbscan
