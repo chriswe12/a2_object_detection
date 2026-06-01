@@ -179,14 +179,6 @@ def check_validity_image_info(K, w, h):
         return False
 
 
-def check_validity_lidar2camera_transformation(R, t):
-    l = [R, t]
-    if all(x is not None for x in l):
-        return True
-    else:
-        return False
-
-
 # ----------------------- Visualisation -----------------------------------
 NO_POSE = -1
 

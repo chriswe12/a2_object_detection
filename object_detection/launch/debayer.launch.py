@@ -18,11 +18,6 @@ def generate_launch_description():
     # Declare all launch arguments
     declared_arguments = [
         DeclareLaunchArgument(
-            "smb_name",
-            default_value=EnvironmentVariable("SMB_NAME", default_value="smb261"),
-            description="Name of the SMB in the format smb26x (relevant for calibrations)",
-        ),
-        DeclareLaunchArgument(
             "gpu",
             default_value="local",
             description="Run on GPU? Options: 'local', 'remote' (default), 'off'",
@@ -121,14 +116,6 @@ def generate_launch_description():
                     # Camera Lidar synchronization related
                     {"camera_lidar_sync_queue_size": 10},
                     {"camera_lidar_sync_slop": 0.1},
-                    # Point Projector related
-                    {
-                        "project_config": [
-                            TextSubstitution(text="projector_config_"),
-                            LaunchConfiguration("smb_name"),
-                            TextSubstitution(text=".yaml"),
-                        ]
-                    },
                     # Object detection related
                     {"model": LaunchConfiguration("model")},
                     {"model_dir_path": LaunchConfiguration("model_dir_path")},

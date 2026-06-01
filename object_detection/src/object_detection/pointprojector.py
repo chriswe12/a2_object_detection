@@ -1,51 +1,27 @@
 #!/usr/bin/env python3
-import yaml
 import numpy as np
 from rclpy.node import Node
 from rclpy.logging import get_logger
-
-from object_detection.utils import check_validity_lidar2camera_transformation
 
 AXIS_X = 0
 AXIS_Y = 1
 
 
 class PointProjector:
-    def __init__(self, node, config_path):
+    def __init__(self, node):
         self.node = node
         self.logger = node.get_logger() if node else get_logger("point_projector")
 
-        try:
-            with open(config_path) as file:
-                self.config = yaml.safe_load(file)
-                R_camera_lidar = np.float64(self.config["R_camera_lidar"])
-                R_correction = np.float64(self.config["R_correction"])
-                t_camera_lidar = np.float64(self.config["t_camera_lidar"])
-                t_correction = np.float64(self.config["t_correction"])
-                self.forward_axis = self.config["forward_axis"]
-
-            if not check_validity_lidar2camera_transformation(
-                R_camera_lidar, t_camera_lidar
-            ):
-                self.logger.error(
-                    f"Lidar to Camera transformation matrices are not correctly configured in {config_path}"
-                )
-                raise RuntimeError("Invalid transformation matrices")
-
-            R_camera_lidar = R_camera_lidar @ R_correction
-            t_camera_lidar = t_camera_lidar + t_correction
-
-            self.set_extrinsic_params(R_camera_lidar, t_camera_lidar)
-            self.K = None
-            self.w = None
-            self.h = None
-            self.P = None
-
-            self.logger.info("PointProjector initialized successfully")
-
-        except Exception as e:
-            self.logger.error(f"Failed to initialize PointProjector: {str(e)}")
-            raise
+        self.K = None
+        self.w = None
+        self.h = None
+        self.P = None
+        
+        # Standard ROS camera optical frame uses the Z-axis for forward depth. 
+        # (1-based index 3, which resolves to axis index 2 below)
+        self.forward_axis = 3
+        
+        self.logger.info("PointProjector initialized successfully")
 
     def set_intrinsic_params(self, K, size):
         """Set camera intrinsic parameters"""
@@ -55,24 +31,6 @@ class PointProjector:
         self.P = np.zeros((3, 4))
         self.P[:, :3] = self.K
         self.logger.debug("Intrinsic parameters set")
-
-    def set_extrinsic_params(self, R, t):
-        """Set camera extrinsic parameters"""
-        self.R = R
-        self.t = t
-        self.T = np.eye(4)
-        self.T[:3, :3] = R
-        self.T[:3, 3] = t
-        self.logger.debug("Extrinsic parameters set")
-
-    def transform_points(self, points):
-        """Transform points from lidar to camera frame"""
-        homo_coor = np.ones(points.shape[0])
-        XYZ = np.vstack((np.transpose(points), homo_coor))
-        self.logger.info(f"Transformed points shape: {XYZ.shape}")
-        XYZ = self.T @ XYZ
-        XYZ = XYZ / XYZ[3, :]
-        return np.transpose(XYZ[:3, :])
 
     def project_points(self, points):
         """Project points from camera frame to image plane"""

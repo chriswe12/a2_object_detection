@@ -12,6 +12,8 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo, PointField
 from geometry_msgs.msg import PoseArray, Pose, Quaternion
+from tf2_ros import Buffer, TransformListener, TransformException
+from scipy.spatial.transform import Rotation
 
 from object_detection_msgs.msg import (
     PointCloudArray,
@@ -54,7 +56,6 @@ class ObjectDetectionNode(Node):
                 ("object_detection_info_topic", "detection_info"),
                 ("camera_lidar_sync_queue_size", 10),
                 ("camera_lidar_sync_slop", 0.05),
-                ("project_config", "projector_config.yaml"),
                 ("architecture", "yolo"),
                 ("model", "yolov5n6"),
                 ("model_dir_path", ""),
@@ -121,9 +122,12 @@ class ObjectDetectionNode(Node):
         # ---------- Config Directory ----------
         self.config_dir = join(get_package_share_directory("object_detection"), "cfg")
 
+        # ---------- Setup TF ----------
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         # ---------- Setup PointProjector ----------
-        project_cfg = self.get_parameter("project_config").value
-        self.point_projector = PointProjector(self, join(self.config_dir, project_cfg))
+        self.point_projector = PointProjector(self)
 
         # ---------- Setup 2D Object Detection ----------
         self.object_detector = ObjectDetectorONNX(
@@ -246,10 +250,23 @@ class ObjectDetectionNode(Node):
                 point_cloud_xyz, self.get_parameter("ground_percentage").value
             )
 
+            # Get transform from TF
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    self.optical_frame_id,
+                    lidar_msg.header.frame_id,
+                    rclpy.time.Time()
+                )
+            except TransformException as ex:
+                self.get_logger().info(f'Could not transform points from {lidar_msg.header.frame_id} to {self.optical_frame_id}: {ex}')
+                return
+            
+            translation = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
+            quaternion = [t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w]
+            rotation_matrix = Rotation.from_quat(quaternion).as_matrix()
+
             # Transform points
-            transformed_points = self.point_projector.transform_points(
-                point_cloud_xyz[:, :3]
-            )
+            transformed_points = np.dot(point_cloud_xyz[:, :3], rotation_matrix.T) + translation
             point_cloud_xyz[:, :3] = transformed_points
 
             # Project points and validate results
