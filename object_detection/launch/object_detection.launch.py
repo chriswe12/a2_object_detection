@@ -45,7 +45,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "object_detection_classes",
-            default_value="[40,41,42]",
+            default_value="[25,28,74]",
             description="List of the ids of classes for detection (COCO dataset)",
         ),
         DeclareLaunchArgument(
@@ -99,7 +99,7 @@ def generate_launch_description():
                     {"model": LaunchConfiguration("model")},
                     {"model_dir_path": LaunchConfiguration("model_dir_path")},
                     {"device": "cpu"},
-                    {"confident": 0.0},
+                    {"confident": 0.7},
                     {"iou": 0.0},
                     {"classes": LaunchConfiguration("object_detection_classes")},
                     {"multiple_instance": False},

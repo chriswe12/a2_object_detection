@@ -185,6 +185,13 @@ class ObjectDetectorONNX:
             # Get class indices
             class_indices = np.argmax(class_probs, axis=1)
 
+            # Filter by allowed classes if specified
+            if self.classes is not None and len(self.classes) > 0:
+                class_mask = np.isin(class_indices, self.classes)
+                boxes = boxes[class_mask]
+                confidences = confidences[class_mask]
+                class_indices = class_indices[class_mask]
+
             # Convert center coordinates to corner coordinates
             cx = boxes[:, 0]
             cy = boxes[:, 1]
@@ -236,7 +243,7 @@ class ObjectDetectorONNX:
             outputs = self.session.run(None, {self.input_name: input_image})
 
             detection = self.postprocess(
-                outputs, original_width, original_height, scale, pad_top, pad_left
+                outputs, original_width, original_height, scale, pad_top, pad_left, conf_threshold=self.confident
             )
 
             if not self.multiple_instance:
