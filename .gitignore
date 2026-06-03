@@ -2,4 +2,4 @@
 *.vscode
 *.bag
 __pycache__/
-# object_detection/models/
+object_detection/models/
