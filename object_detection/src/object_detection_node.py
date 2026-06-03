@@ -12,6 +12,7 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from sensor_msgs.msg import Image, PointCloud2, CameraInfo, PointField
 from geometry_msgs.msg import PoseArray, Pose, Quaternion
+from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import Buffer, TransformListener, TransformException
 from scipy.spatial.transform import Rotation
 
@@ -93,6 +94,8 @@ class ObjectDetectionNode(Node):
             self.get_parameter("object_detection_info_topic").value,
             10,
         )
+
+        self.marker_pub = self.create_publisher(MarkerArray, "object_markers", 10)
 
         # ---------- Setup subscribers ----------
         qos_profile = QoSProfile(
@@ -309,6 +312,13 @@ class ObjectDetectionNode(Node):
             object_info_array = ObjectDetectionInfoArray(header=header)
             point_cloud_array = PointCloudArray(header=header)
 
+            # Build marker array — clear stale markers first, then add one
+            # sphere + one text label per detected object.
+            marker_array = MarkerArray()
+            clear = Marker()
+            clear.action = Marker.DELETEALL
+            marker_array.markers.append(clear)
+
             # Populate messages
             for i, obj in enumerate(object_list):
                 # Create pose
@@ -360,6 +370,40 @@ class ObjectDetectionNode(Node):
                 )
                 point_cloud_array.point_clouds.append(point_cloud_msg)
 
+                # --- RViz markers ---
+                class_name = str(object_detection_result["name"][i])
+                c255 = CLASS_COLOR.get(class_name, (255, 255, 0))
+                color = (c255[0] / 255.0, c255[1] / 255.0, c255[2] / 255.0)
+
+                sphere = marker_(
+                    ns="objects",
+                    marker_id=i * 2,
+                    pos=[float(obj.pos[0]), float(obj.pos[1]), float(obj.pos[2])],
+                    stamp=image_msg.header.stamp,
+                    color=color,
+                    frame_id=self.optical_frame_id,
+                )
+                marker_array.markers.append(sphere)
+
+                label = Marker()
+                label.header.frame_id = self.optical_frame_id
+                label.header.stamp = image_msg.header.stamp
+                label.ns = "object_labels"
+                label.id = i * 2 + 1
+                label.type = Marker.TEXT_VIEW_FACING
+                label.action = Marker.ADD
+                label.pose.position.x = float(obj.pos[0])
+                label.pose.position.y = float(obj.pos[1]) - 0.15  # above sphere
+                label.pose.position.z = float(obj.pos[2])
+                label.pose.orientation.w = 1.0
+                label.scale.z = 0.15
+                label.color.r = 1.0
+                label.color.g = 1.0
+                label.color.b = 1.0
+                label.color.a = 1.0
+                label.text = class_name
+                marker_array.markers.append(label)
+
                 # Visualize if enabled
                 if (
                     not self.get_parameter("project_all_points_to_image").value
@@ -409,6 +453,7 @@ class ObjectDetectionNode(Node):
                     except Exception as e:
                         self.get_logger().warn(f"Could not draw circle: {str(e)}")
             # Publish results
+            self.marker_pub.publish(marker_array)
             self.object_pose_pub.publish(object_pose_array)
             self.detection_info_pub.publish(object_info_array)
             self.object_point_clouds_pub.publish(point_cloud_array)

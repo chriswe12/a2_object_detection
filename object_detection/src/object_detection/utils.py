@@ -183,12 +183,15 @@ def check_validity_image_info(K, w, h):
 NO_POSE = -1
 
 CLASS_COLOR = {
-    "person": (255, 0, 0),
-    "bicycle": (0, 255, 0),
-    "umbrella": (0, 0, 255),
-    "bottle": (125, 125, 0),
-    "clock": (0, 125, 125),
-    "bench": (125, 0, 125),
+    "person":     (255,   0,   0),
+    "bicycle":    (  0, 255,   0),
+    "umbrella":   (  0,   0, 255),
+    "bottle":     (125, 125,   0),
+    "clock":      (  0, 125, 125),
+    "bench":      (125,   0, 125),
+    "wine glass": (200, 100, 255),
+    "cup":        (255, 150,   0),
+    "fork":       (  0, 200, 200),
 }
 
 
@@ -206,10 +209,10 @@ def marker_(ns, marker_id, pos, stamp, color, frame_id="map"):
     marker.pose.position.y = pos[1]
     marker.pose.position.z = pos[2]
 
-    marker.pose.orientation.x = 0
-    marker.pose.orientation.y = 0
-    marker.pose.orientation.z = 0
-    marker.pose.orientation.w = 1
+    marker.pose.orientation.x = 0.0
+    marker.pose.orientation.y = 0.0
+    marker.pose.orientation.z = 0.0
+    marker.pose.orientation.w = 1.0
 
     marker.color.r = color[0]
     marker.color.g = color[1]
