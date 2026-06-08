@@ -221,9 +221,9 @@ def marker_(ns, marker_id, pos, stamp, color, frame_id="map"):
 
     marker.id = marker_id
 
-    marker.scale.x = 0.2
-    marker.scale.y = 0.2
-    marker.scale.z = 1.0
+    marker.scale.x = 0.1
+    marker.scale.y = 0.1
+    marker.scale.z = 0.1
 
     marker.frame_locked = False
 
