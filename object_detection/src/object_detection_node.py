@@ -21,6 +21,13 @@ from object_detection_msgs.msg import (
     ObjectDetectionInfo,
     ObjectDetectionInfoArray,
 )
+from foxglove_msgs.msg import (
+    ImageAnnotations,
+    PointsAnnotation,
+    TextAnnotation,
+    Point2,
+    Color,
+)
 from std_msgs.msg import Header
 
 from object_detection.objectdetectorONNX import ObjectDetectorONNX
@@ -55,6 +62,7 @@ class ObjectDetectionNode(Node):
                 ("object_detection_output_image_topic", "detections_in_image"),
                 ("object_detection_point_clouds_topic", "detection_point_clouds"),
                 ("object_detection_info_topic", "detection_info"),
+                ("image_annotations_topic", "detection_annotations"),
                 ("camera_lidar_sync_queue_size", 10),
                 ("camera_lidar_sync_slop", 0.05),
                 ("architecture", "yolo"),
@@ -71,6 +79,7 @@ class ObjectDetectionNode(Node):
                 ("object_specific_file", "object_specific.yaml"),
                 ("min_cluster_size", 5),
                 ("cluster_selection_epsilon", 0.08),
+                ("max_object_depth", 0.25),
                 ("classes", [40, 41, 42]),
             ],
         )
@@ -93,6 +102,14 @@ class ObjectDetectionNode(Node):
         self.detection_info_pub = self.create_publisher(
             ObjectDetectionInfoArray,
             self.get_parameter("object_detection_info_topic").value,
+            10,
+        )
+
+        # Foxglove image annotations (boxes + projected points + text labels),
+        # overlaid on the raw camera image in Foxglove's Image panel.
+        self.image_annotations_pub = self.create_publisher(
+            ImageAnnotations,
+            self.get_parameter("image_annotations_topic").value,
             10,
         )
 
@@ -170,6 +187,7 @@ class ObjectDetectionNode(Node):
                 "cluster_selection_epsilon": self.get_parameter(
                     "cluster_selection_epsilon"
                 ).value,
+                "max_object_depth": self.get_parameter("max_object_depth").value,
             },
             self.config_dir,
         )
@@ -312,11 +330,20 @@ class ObjectDetectionNode(Node):
             object_pose_array = PoseArray(header=header)
             object_info_array = ObjectDetectionInfoArray(header=header)
             point_cloud_array = PointCloudArray(header=header)
+            # Foxglove image annotations: one LINE_LOOP box + text per detection,
+            # plus a single POINTS annotation accumulating projected lidar points.
+            image_annotations = ImageAnnotations()
+            points_annotation = PointsAnnotation()
+            points_annotation.timestamp = header.stamp
+            points_annotation.type = PointsAnnotation.POINTS
+            points_annotation.thickness = 3.0
 
             # Build marker array — clear stale markers first, then add one
             # sphere + one text label per detected object.
             marker_array = MarkerArray()
             clear = Marker()
+            clear.header.frame_id = self.optical_frame_id
+            clear.header.stamp = image_msg.header.stamp
             clear.action = Marker.DELETEALL
             marker_array.markers.append(clear)
 
@@ -357,6 +384,37 @@ class ObjectDetectionNode(Node):
                     object_detection_result["ymax"][i]
                 )
                 object_info_array.info.append(object_information)
+
+                # Bounding-box pixel coords + label, used by the Foxglove annotation.
+                xmin = int(object_detection_result["xmin"][i])
+                ymin = int(object_detection_result["ymin"][i])
+                xmax = int(object_detection_result["xmax"][i])
+                ymax = int(object_detection_result["ymax"][i])
+                cls = str(object_detection_result["name"][i])
+                score = float(object_detection_result["confidence"][i])
+
+                # Foxglove annotation: bounding box (LINE_LOOP) + label text
+                box_ann = PointsAnnotation()
+                box_ann.timestamp = header.stamp
+                box_ann.type = PointsAnnotation.LINE_LOOP
+                box_ann.thickness = 2.0
+                box_ann.outline_color = Color(r=0.0, g=1.0, b=0.0, a=1.0)
+                box_ann.points = [
+                    Point2(x=float(xmin), y=float(ymin)),
+                    Point2(x=float(xmax), y=float(ymin)),
+                    Point2(x=float(xmax), y=float(ymax)),
+                    Point2(x=float(xmin), y=float(ymax)),
+                ]
+                image_annotations.points.append(box_ann)
+
+                text_ann = TextAnnotation()
+                text_ann.timestamp = header.stamp
+                text_ann.position = Point2(x=float(xmin), y=float(max(ymin - 4, 0)))
+                text_ann.text = f"{cls} {score:.2f}"
+                text_ann.font_size = 14.0
+                text_ann.text_color = Color(r=1.0, g=1.0, b=1.0, a=1.0)
+                text_ann.background_color = Color(r=0.0, g=1.0, b=0.0, a=0.5)
+                image_annotations.texts.append(text_ann)
                 # Create point cloud
                 object_point_cloud = pointcloud_in_fov[obj.pt_indices]
                 # Debug logging to understand the shape
@@ -425,6 +483,13 @@ class ObjectDetectionNode(Node):
                         try:
                             dist = object_point_cloud[idx, 2]
                             color = depth_color(dist, min_d=0.5, max_d=20)
+                            points_annotation.points.append(
+                                Point2(x=float(pt[0]), y=float(pt[1]))
+                            )
+                            points_annotation.outline_colors.append(
+                                Color(r=color[0] / 255.0, g=color[1] / 255.0,
+                                      b=color[2] / 255.0, a=1.0)
+                            )
                             # Make a copy of the image before drawing
                             object_detection_image = object_detection_image.copy()
 
@@ -443,6 +508,13 @@ class ObjectDetectionNode(Node):
                 for idx, pt in enumerate(points_on_image):
                     dist = pointcloud_in_fov[idx, 2]
                     color = depth_color(dist, min_d=0.5, max_d=30)
+                    points_annotation.points.append(
+                        Point2(x=float(pt[0]), y=float(pt[1]))
+                    )
+                    points_annotation.outline_colors.append(
+                        Color(r=color[0] / 255.0, g=color[1] / 255.0,
+                              b=color[2] / 255.0, a=1.0)
+                    )
                     try:
                         cv2.circle(
                             object_detection_image,
@@ -453,14 +525,25 @@ class ObjectDetectionNode(Node):
                         )
                     except Exception as e:
                         self.get_logger().warn(f"Could not draw circle: {str(e)}")
+            # Attach the accumulated projected lidar points to the annotation.
+            if points_annotation.points:
+                image_annotations.points.append(points_annotation)
+
             # Publish results
             self.marker_pub.publish(marker_array)
             self.object_pose_pub.publish(object_pose_array)
             self.detection_info_pub.publish(object_info_array)
+            self.image_annotations_pub.publish(image_annotations)
             self.object_point_clouds_pub.publish(point_cloud_array)
-            self.object_detection_img_pub.publish(
-                self.image_reader.cv2_to_imgmsg(object_detection_image, "bgr8")
-            )
+            det_img_msg = self.image_reader.cv2_to_imgmsg(object_detection_image, "bgr8")
+            # cv2_to_imgmsg leaves the header empty — stamp it with the input
+            # image's frame_id + time so it matches camera_info / TF and the
+            # detections (which share `header`). Fall back to the camera optical
+            # frame if the source image header has no frame_id.
+            det_img_msg.header = image_msg.header
+            if not det_img_msg.header.frame_id:
+                det_img_msg.header.frame_id = self.optical_frame_id
+            self.object_detection_img_pub.publish(det_img_msg)
 
             self.get_logger().debug(f"Processing time: {time.time()-start_time:.3f}s")
 

@@ -84,8 +84,13 @@ def generate_launch_description():
         ]
     )
 
-    # Object detection node
+    # Shared tuning params (algorithm/clustering/output topics). Single source of
+    # truth; deployment-specific params below override it.
+    config_file = PathJoinSubstitution(
+        [FindPackageShare("object_detection"), "config", "object_detection.yaml"]
+    )
 
+    # Object detection node
     object_detection_group = GroupAction(
         [
             Node(
@@ -94,7 +99,8 @@ def generate_launch_description():
                 name="object_detector",
                 output="screen",
                 parameters=[
-                    # Input related
+                    config_file,
+                    # --- deployment-specific (override the shared config) ---
                     {
                         "camera_topic": PathJoinSubstitution(
                             [LaunchConfiguration("input_camera_name"), "image_raw"]
@@ -106,28 +112,10 @@ def generate_launch_description():
                         )
                     },
                     {"lidar_topic": LaunchConfiguration("lidar_topic")},
-                    # Output related - load from file
-                    {"project_object_points_to_image": True},
-                    {"project_all_points_to_image": False},
-                    {"object_detection_pos_topic": "object_positions"},
-                    {"object_detection_output_image_topic": "detections_in_image"},
-                    {"object_detection_point_clouds_topic": "detection_point_clouds"},
-                    {"object_detection_info_topic": "detection_info"},
-                    # Camera Lidar synchronization related
-                    {"camera_lidar_sync_queue_size": 10},
-                    {"camera_lidar_sync_slop": 0.1},
-                    # Object detection related
                     {"model": LaunchConfiguration("model")},
                     {"model_dir_path": LaunchConfiguration("model_dir_path")},
                     {"device": "0" if LaunchConfiguration("gpu") != "off" else "cpu"},
-                    {"confident": 0.0},
-                    {"iou": 0.1},
                     {"classes": LaunchConfiguration("object_detection_classes")},
-                    {"multiple_instance": False},
-                    # Object localization related
-                    {"model_method": "hdbscan"},
-                    {"ground_percentage": 25},
-                    {"bb_contract_percentage": 10},
                 ],
             )
         ]

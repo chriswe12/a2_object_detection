@@ -28,8 +28,9 @@ install(PROGRAMS
 )
 
 # Install launch files, config files, rviz files
-install(DIRECTORY 
-  launch 
+install(DIRECTORY
+  launch
+  config
   # rviz
   models
   DESTINATION share/${PROJECT_NAME}

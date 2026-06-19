@@ -60,6 +60,9 @@ class ObjectLocalizer:
         self.bb_contract_percentage = config["bb_contract_percentage"]
         self.min_cluster_size = config["min_cluster_size"]
         self.cluster_selection_epsilon = config["cluster_selection_epsilon"]
+        # Depth slice (m) kept around the chosen cluster's front; falls back to
+        # the module default when not supplied.
+        self.max_object_depth = config.get("max_object_depth", DEFAULT_MAX_OBJECT_DEPTH)
 
         self.distance_estimator = self.estimate_dist_default
         self.id_dict = {}
@@ -322,7 +325,7 @@ class ObjectLocalizer:
                     np.abs(distances - estimated_dist)
                     - min(np.abs(distances - estimated_dist))
                 )
-                < DEFAULT_MAX_OBJECT_DEPTH
+                < self.max_object_depth
             )[0]
             indices = indices[in_range_indices]
             avg = np.mean(in_BB_3D[indices], axis=0)

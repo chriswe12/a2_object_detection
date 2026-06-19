@@ -1,0 +1,39 @@
+# Object detection tuning parameters — single source of truth shared by the
+# sim, real, and debayer launch files (loaded via parameters=[this_file, ...]).
+# Deployment-specific params (camera/lidar topics, device, confidence/iou
+# thresholds, model) stay inline in each launch and override these.
+#
+# The "/**" wildcard applies to the node regardless of its launch name.
+/**:
+  ros__parameters:
+    # --- detection / projection ---
+    model_method: "hdbscan"
+    confident: 0.5                     # detection score threshold
+    iou: 0.1                           # NMS IoU threshold (sim overrides to 0.0)
+    project_object_points_to_image: true
+    project_all_points_to_image: false
+    camera_lidar_sync_queue_size: 10
+    camera_lidar_sync_slop: 0.1
+
+    # --- ground filter ---
+    ground_percentage: 25
+
+    # --- bounding-box point association ---
+    bb_contract_percentage: 10
+
+    # --- HDBSCAN clustering / depth gating ---
+    min_cluster_size: 5
+    cluster_selection_epsilon: 0.08
+    max_object_depth: 0.25            # depth slice (m) kept around the chosen cluster
+
+    # --- distance estimator ---
+    distance_estimator_type: "none"
+    distance_estimator_save_data: false
+    object_specific_file: "object_specific.yaml"
+
+    # --- output topic names ---
+    object_detection_pose_topic: "object_positions"
+    object_detection_output_image_topic: "detections_in_image"
+    object_detection_point_clouds_topic: "detection_point_clouds"
+    object_detection_info_topic: "detection_info"
+    image_annotations_topic: "detection_annotations"
