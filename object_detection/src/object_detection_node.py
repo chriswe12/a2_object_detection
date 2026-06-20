@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
@@ -10,7 +11,7 @@ from os.path import join
 from numpy.lib.recfunctions import unstructured_to_structured
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
-from sensor_msgs.msg import Image, PointCloud2, CameraInfo, PointField
+from sensor_msgs.msg import Image, CompressedImage, PointCloud2, CameraInfo, PointField
 from geometry_msgs.msg import PoseArray, Pose, Quaternion
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import Buffer, TransformListener, TransformException
@@ -122,9 +123,16 @@ class ObjectDetectionNode(Node):
             depth=10,
         )
 
-        self.camera_sub = Subscriber(
-            self, Image, self.get_parameter("camera_topic").value
-        )
+        self._use_compressed = os.environ.get("A2_MODE", "sim") == "robot"
+        camera_topic = self.get_parameter("camera_topic").value
+
+        if self._use_compressed:
+            self.camera_sub = Subscriber(self, CompressedImage, camera_topic)
+            self.get_logger().info(
+                f"[ObjectDetection Node] Using compressed transport: {camera_topic}"
+            )
+        else:
+            self.camera_sub = Subscriber(self, Image, camera_topic)
         self.lidar_sub = Subscriber(
             self,
             PointCloud2,
@@ -244,11 +252,18 @@ class ObjectDetectionNode(Node):
         )
 
         # If Image and Lidar messages are not empty
-        if not image_msg.height > 0:
-            self.get_logger().fatal(
-                "[ObjectDetection Node] Image message is empty. Object detecion is on hold."
-            )
-            return
+        if self._use_compressed:
+            if len(image_msg.data) == 0:
+                self.get_logger().fatal(
+                    "[ObjectDetection Node] Image message is empty. Object detecion is on hold."
+                )
+                return
+        else:
+            if not image_msg.height > 0:
+                self.get_logger().fatal(
+                    "[ObjectDetection Node] Image message is empty. Object detecion is on hold."
+                )
+                return
         if not lidar_msg.width > 0:
             self.get_logger().fatal(
                 "[ObjectDetection Node] Lidar message is empty. Object detecion is on hold."
@@ -257,7 +272,10 @@ class ObjectDetectionNode(Node):
 
         try:
             # Read message
-            cv_image = self.image_reader.imgmsg_to_cv2(image_msg, "bgr8")
+            if self._use_compressed:
+                cv_image = self.image_reader.compressed_imgmsg_to_cv2(image_msg, "bgr8")
+            else:
+                cv_image = self.image_reader.imgmsg_to_cv2(image_msg, "bgr8")
 
             point_cloud_xyz = pointcloud2_to_xyz_array(lidar_msg)
             # Validate point cloud data

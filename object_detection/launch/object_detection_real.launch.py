@@ -31,7 +31,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "input_camera_name",
-            default_value="/rgb_camera",
+            default_value="/camera",
             description="Name of the camera, i.e. topic prefix for camera stream and camera info",
         ),
         DeclareLaunchArgument(
@@ -46,7 +46,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "object_detection_classes",
-            default_value="[0,24,25,28,32,39,41,45,46,47,56]",
+            default_value="[39]",
             description="List of the ids of classes for detection (COCO dataset)",
         ),
         DeclareLaunchArgument(
@@ -104,7 +104,7 @@ def generate_launch_description():
                     # --- deployment-specific (override the shared config) ---
                     {
                         "camera_topic": PathJoinSubstitution(
-                            [LaunchConfiguration("input_camera_name"), "image_debayered"]
+                            [LaunchConfiguration("input_camera_name"), "image/compressed"]
                         )
                     },
                     {
