@@ -12,12 +12,13 @@ scipy==1.17.1
 tqdm==4.67.3
 
 # detection -----------------------------------
-yolov5==7.0.14
+# Inference runs through ONNX Runtime (see objectdetectorONNX.py). yolov5/torch
+# were only used offline to export the .onnx model, so they're intentionally NOT
+# installed here — torch pulls a multi-GB CUDA wheel stack that nothing imports
+# and that overflowed the image build. For GPU inference later (e.g. on the AGX),
+# swap onnxruntime -> the Jetson onnxruntime-gpu build; torch stays out.
 onnxruntime==1.26.0
-# Logging -------------------------------------
-tensorboard==2.20.0
-tensorboard-data-server==0.7.2
-# Plotting ------------------------------------
+
+# data / clustering ---------------------------
 pandas==3.0.3
-seaborn==0.13.2
 hdbscan==0.8.43
