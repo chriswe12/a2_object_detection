@@ -41,7 +41,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "lidar_topic",
-            default_value="/rslidar/points",
+            default_value="/front_lidar/points",
             description="Topic containing the point cloud from the lidar",
         ),
         DeclareLaunchArgument(
