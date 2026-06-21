@@ -7,12 +7,9 @@ from launch.substitutions import (
     EnvironmentVariable,
     PathJoinSubstitution,
     PythonExpression,
-    TextSubstitution,
 )
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-from ament_index_python.packages import get_package_share_directory
-import os
 
 
 def generate_launch_description():
@@ -104,7 +101,7 @@ def generate_launch_description():
                     # --- deployment-specific (override the shared config) ---
                     {
                         "camera_topic": PathJoinSubstitution(
-                            [LaunchConfiguration("input_camera_name"), "image/compressed"]
+                            [LaunchConfiguration("input_camera_name"), "image_raw"]
                         )
                     },
                     {
