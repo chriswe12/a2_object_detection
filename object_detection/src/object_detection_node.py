@@ -222,7 +222,8 @@ class ObjectDetectionNode(Node):
             self.object_localizer.set_intrinsic_camera_param(K)
             self.optical_frame_id = msg.header.frame_id
             self.get_logger().info(
-                "[ObjectDetection Node] Image info is set! Detection will start..."
+                "[ObjectDetection Node] Image info is set! Detection will start...",
+                once=True,
             )
             self.image_info_received = True
         else:
@@ -302,9 +303,11 @@ class ObjectDetectionNode(Node):
             pointcloud_in_fov = point_cloud_xyz[in_fov_indices]
 
             # Detect objects
+            infer_start = time.time()
             object_detection_result, object_detection_image = (
                 self.object_detector.detect(cv_image)
             )
+            infer_ms = (time.time() - infer_start) * 1000
             if (
                 object_detection_result is None
                 or len(object_detection_result.get("name", [])) == 0
@@ -319,8 +322,6 @@ class ObjectDetectionNode(Node):
                 point_cloud_xyz[in_fov_indices],
                 cv_image,
             )
-            self.get_logger().info(f"Number of detected objects: {len(object_list)}")
-
             # Create and publish results
             header = Header()
             header.stamp = image_msg.header.stamp
@@ -416,11 +417,6 @@ class ObjectDetectionNode(Node):
                 image_annotations.texts.append(text_ann)
                 # Create point cloud
                 object_point_cloud = pointcloud_in_fov[obj.pt_indices]
-                # Debug logging to understand the shape
-                self.get_logger().info(
-                    f"Original object_point_cloud shape: {object_point_cloud.shape}"
-                )
-                # Convert to PointCloud2 message (utils)
                 point_cloud_msg = array_to_pointcloud2(
                     object_point_cloud,
                     frame_id=self.optical_frame_id,
@@ -544,7 +540,12 @@ class ObjectDetectionNode(Node):
                 det_img_msg.header.frame_id = self.optical_frame_id
             self.object_detection_img_pub.publish(det_img_msg)
 
-            self.get_logger().debug(f"Processing time: {time.time()-start_time:.3f}s")
+            total_ms = (time.time() - start_time) * 1000
+            fps = 1000.0 / total_ms if total_ms > 0 else 0.0
+            self.get_logger().info(
+                f"{len(object_list)} obj | infer {infer_ms:.0f}ms | total {total_ms:.0f}ms | {fps:.1f} FPS",
+                throttle_duration_sec=1.0,
+            )
 
         except Exception as e:
             self.get_logger().error(f"Error in sync_callback: {str(e)}")

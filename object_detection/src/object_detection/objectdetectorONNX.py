@@ -106,13 +106,16 @@ class ObjectDetectorONNX:
                 onnx_model_path = os.path.join(
                     self.model_dir_path, self.model + ".onnx"
                 )
-                print(f"Loading ONNX model from: {onnx_model_path}")
                 self.session = rt.InferenceSession(onnx_model_path, providers=[
                         #'TensorrtExecutionProvider',
                         'CUDAExecutionProvider',
                         'CPUExecutionProvider'
                     ])
-                self.input_name = self.session.get_inputs()[0].name
+                inp = self.session.get_inputs()[0]
+                self.input_name = inp.name
+                self.input_dtype = np.float16 if "float16" in inp.type else np.float32
+                self.input_size = inp.shape[2]  # [1, 3, H, W]
+                print(f"[ObjectDetectorONNX] Loaded: {onnx_model_path} | input {self.input_size}px {inp.type} | output {self.session.get_outputs()[0].shape}", flush=True)
             else:
                 raise ValueError("No model path defined for ONNX model.")
         elif self.architecture == "detectron":
@@ -124,7 +127,7 @@ class ObjectDetectorONNX:
 
     def preprocess(self, image):
         # Maintain aspect ratio and pad the image to the required input size
-        input_size = 640
+        input_size = self.input_size
         h, w, _ = image.shape
         scale = min(input_size / h, input_size / w)
         nh, nw = int(h * scale), int(w * scale)
@@ -145,7 +148,7 @@ class ObjectDetectorONNX:
             value=(114, 114, 114),
         )
 
-        image_padded = image_padded.astype(np.float16) / 255.0
+        image_padded = image_padded.astype(self.input_dtype) / 255.0
         image_padded = np.transpose(image_padded, (2, 0, 1))  # Change to (C, H, W)
         image_padded = np.expand_dims(image_padded, axis=0)  # Add batch dimension
         return image_padded, scale, top, left
@@ -167,6 +170,25 @@ class ObjectDetectorONNX:
                 detection = detection[0]
 
             detection = detection[0]
+
+            # YOLO26 end2end output: [300, 6] = [x1, y1, x2, y2, conf, class_id], NMS done in model
+            if detection.shape[1] == 6:
+                mask = detection[:, 4] > conf_threshold
+                detection = detection[mask]
+                x1, y1, x2, y2 = detection[:, 0], detection[:, 1], detection[:, 2], detection[:, 3]
+                confidences = detection[:, 4]
+                class_indices = detection[:, 5].astype(int)
+                if self.classes is not None and len(self.classes) > 0:
+                    cm = np.isin(class_indices, self.classes)
+                    x1, y1, x2, y2 = x1[cm], y1[cm], x2[cm], y2[cm]
+                    confidences, class_indices = confidences[cm], class_indices[cm]
+                x1 = np.clip((x1 - pad_left) / scale, 0, original_width)
+                y1 = np.clip((y1 - pad_top) / scale, 0, original_height)
+                x2 = np.clip((x2 - pad_left) / scale, 0, original_width)
+                y2 = np.clip((y2 - pad_top) / scale, 0, original_height)
+                filtered_names = [self.class_dict.get(c, str(c)) for c in class_indices]
+                return pd.DataFrame({"xmin": x1, "ymin": y1, "xmax": x2, "ymax": y2,
+                                     "confidence": confidences, "class": class_indices, "name": filtered_names})
 
             if detection.shape[1] != 85:
                 raise ValueError("Detection tensor shape is incorrect.")
