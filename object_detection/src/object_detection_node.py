@@ -323,17 +323,19 @@ class ObjectDetectionNode(Node):
             cv_image = self.image_reader.imgmsg_to_cv2(image_msg, "bgr8")
 
             point_cloud_xyz = pointcloud2_to_xyz_array(lidar_msg)
+            # Strip NaN points (some lidars encode invalid returns as NaN)
+            point_cloud_xyz = point_cloud_xyz[~np.isnan(point_cloud_xyz).any(axis=1)]
             # Validate point cloud data
             if point_cloud_xyz is None or point_cloud_xyz.shape[0] == 0:
                 self.get_logger().warn("Empty point cloud received")
                 return
 
-            # Ground filter
-            # Upward direction is Z which 3rd column in the matrix
-            # It is positive because it increases upwards
-            point_cloud_xyz = filter_ground(
-                point_cloud_xyz, self.get_parameter("ground_percentage").value
-            )
+            # TODO: ground filter is disabled — it runs before the TF transform so the
+            # upward axis assumption (Z) is wrong for front_lidar_link (upward is X there).
+            # If re-enabled, apply after the transform and use upward=-1 (camera optical -Y).
+            # point_cloud_xyz = filter_ground(
+            #     point_cloud_xyz, self.get_parameter("ground_percentage").value
+            # )
 
             # Get transform from TF
             try:
@@ -343,9 +345,9 @@ class ObjectDetectionNode(Node):
                     rclpy.time.Time()
                 )
             except TransformException as ex:
-                self.get_logger().info(f'Could not transform points from {lidar_msg.header.frame_id} to {self.optical_frame_id}: {ex}')
+                self.get_logger().info(f'Could not transform points from {lidar_msg.header.frame_id} to {self.optical_frame_id}: {ex}', throttle_duration_sec=1.0)
                 return
-            
+
             translation = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
             quaternion = [t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w]
             rotation_matrix = Rotation.from_quat(quaternion).as_matrix()
@@ -376,6 +378,12 @@ class ObjectDetectionNode(Node):
                 or len(object_detection_result.get("name", [])) == 0
             ):
                 self.get_logger().debug("No objects detected")
+                total_ms = (time.time() - start_time) * 1000
+                fps = 1000.0 / total_ms if total_ms > 0 else 0.0
+                self.get_logger().info(
+                    f"0 obj | infer {infer_ms:.0f}ms | total {total_ms:.0f}ms | {fps:.1f} FPS",
+                    throttle_duration_sec=1.0,
+                )
                 return
 
             # Localize objects
