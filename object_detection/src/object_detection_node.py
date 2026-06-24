@@ -285,7 +285,8 @@ class ObjectDetectionNode(Node):
                 self._det_logger = DetectionLogger(log_path)
                 self._det_logger.log_metadata(K, w, h, msg.header.frame_id)
                 self.get_logger().info(
-                    f"[ObjectDetection] Logging detections to {self._det_logger.path}"
+                    f"[ObjectDetection] Logging detections to {self._det_logger.path}, "
+                    f"global objects to {self._det_logger.global_path}"
                 )
         else:
             self.get_logger().error(
@@ -792,8 +793,13 @@ class ObjectDetectionNode(Node):
         self.global_marker_pub.publish(marker_array)
         self.global_info_pub.publish(info_array)
 
+        if self._det_logger is not None and self.global_objects:
+            self._det_logger.write_global_objects(self.global_objects, stamp)
+
     def destroy_node(self):
         if self._det_logger is not None:
+            if self.global_objects:
+                self._det_logger.write_global_objects(self.global_objects, stamp=None)
             self._det_logger.close()
         super().destroy_node()
 

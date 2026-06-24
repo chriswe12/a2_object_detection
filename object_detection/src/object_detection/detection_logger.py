@@ -47,6 +47,8 @@ class DetectionLogger:
         if not os.path.isabs(file_path):
             file_path = os.path.join(os.path.expanduser("~"), file_path)
         self._path = file_path
+        base, _ = os.path.splitext(self._path)
+        self._global_path = base + "_global.json"
         parent = os.path.dirname(self._path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -115,6 +117,37 @@ class DetectionLogger:
             record["point_map"] = [float(v) for v in point_map]
             record["map_frame"] = map_frame
         self._write(record)
+
+    def write_global_objects(self, global_objects, stamp=None) -> None:
+        """Overwrite the global objects file with the current best-guess map.
+
+        Args:
+            global_objects: list of GlobalObject instances.
+            stamp: optional ROS stamp (has .sec / .nanosec).
+        """
+        import json as _json
+        timestamp_ns = None
+        if stamp is not None:
+            timestamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        data = {
+            "timestamp_ns": timestamp_ns,
+            "objects": [
+                {
+                    "id": int(g.id),
+                    "class_id": g.name,
+                    "position": [float(v) for v in g.position],
+                    "confidence": float(g.confidence),
+                    "observation_count": int(g.count),
+                }
+                for g in global_objects
+            ],
+        }
+        with open(self._global_path, "w") as f:
+            _json.dump(data, f, indent=2)
+
+    @property
+    def global_path(self) -> str:
+        return self._global_path
 
     def close(self) -> None:
         self._f.close()
