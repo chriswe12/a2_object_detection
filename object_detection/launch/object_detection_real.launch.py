@@ -59,6 +59,17 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "model", default_value="yolov5l6", description="yolo model name"
         ),
+        DeclareLaunchArgument(
+            "log_detections",
+            default_value="false",
+            description="Write a JSONL detection log for post-mission SLAM fusion",
+            choices=["true", "false"],
+        ),
+        DeclareLaunchArgument(
+            "log_file_path",
+            default_value="",
+            description="Path for the JSONL log (empty = ~/object_detections_<timestamp>.jsonl)",
+        ),
     ]
 
     # Debayer the image (conditionally included)
@@ -116,6 +127,10 @@ def generate_launch_description():
                         ["'cpu' if '", LaunchConfiguration("gpu"), "' == 'off' else '0'"]
                     )},
                     {"classes": LaunchConfiguration("object_detection_classes")},
+                    {"log_detections": PythonExpression(
+                        ["'", LaunchConfiguration("log_detections"), "' == 'true'"]
+                    )},
+                    {"log_file_path": LaunchConfiguration("log_file_path")},
                 ],
             )
         ]

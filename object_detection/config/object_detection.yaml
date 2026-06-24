@@ -12,7 +12,7 @@
 
     # --- detection / projection ---
     model_method: "hdbscan"
-    confident: 0.5                     # detection score threshold
+    confident: 0.25                    # detection score threshold
     iou: 0.1                           # NMS IoU threshold (sim overrides to 0.0)
     project_object_points_to_image: true
     project_all_points_to_image: false
@@ -34,6 +34,10 @@
     distance_estimator_type: "none"
     distance_estimator_save_data: false
     object_specific_file: "object_specific.yaml"
+
+    # --- detection logging (post-mission SLAM fusion) ---
+    log_detections: false          # set true on real missions to write JSONL log
+    log_file_path: ""              # empty → ~/object_detections_<timestamp>.jsonl
 
     # --- output topic names ---
     object_detection_pose_topic: "object_positions"

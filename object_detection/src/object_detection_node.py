@@ -33,6 +33,7 @@ from std_msgs.msg import Header
 from object_detection.objectdetectorONNX import ObjectDetectorONNX
 from object_detection.pointprojector import PointProjector
 from object_detection.objectlocalizer import ObjectLocalizer
+from object_detection.detection_logger import DetectionLogger
 from object_detection.utils import *
 
 # from object_detection.ros_numpy import *
@@ -81,6 +82,8 @@ class ObjectDetectionNode(Node):
                 ("cluster_selection_epsilon", 0.08),
                 ("max_object_depth", 0.25),
                 ("classes", [11, 24, 25, 39, 74]),
+                ("log_detections", False),
+                ("log_file_path", ""),
             ],
         )
 
@@ -198,6 +201,7 @@ class ObjectDetectionNode(Node):
         self.image_info_received = False
         self._K = None
         self._dist_coeffs = None
+        self._det_logger = None
 
         self.get_logger().info(
             "[ObjectDetection Node] Object Detector initilization done."
@@ -232,6 +236,14 @@ class ObjectDetectionNode(Node):
                 once=True,
             )
             self.image_info_received = True
+
+            if self.get_parameter("log_detections").value and self._det_logger is None:
+                log_path = self.get_parameter("log_file_path").value
+                self._det_logger = DetectionLogger(log_path)
+                self._det_logger.log_metadata(K, w, h, msg.header.frame_id)
+                self.get_logger().info(
+                    f"[ObjectDetection] Logging detections to {self._det_logger.path}"
+                )
         else:
             self.get_logger().error(
                 " ------------------ camera_info not valid ------------------------"
@@ -401,6 +413,17 @@ class ObjectDetectionNode(Node):
                 cls = str(object_detection_result["name"][i])
                 score = float(object_detection_result["confidence"][i])
 
+                if self._det_logger is not None:
+                    self._det_logger.log_detection(
+                        stamp=image_msg.header.stamp,
+                        class_id=cls,
+                        confidence=score,
+                        point_cam=obj.pos,
+                        bbox=[xmin, ymin, xmax, ymax],
+                        camera_frame=self.optical_frame_id,
+                        estimation_type=str(obj.estimation_type),
+                    )
+
                 # Foxglove annotation: bounding box (LINE_LOOP) + label text
                 box_ann = PointsAnnotation()
                 box_ann.timestamp = header.stamp
@@ -557,6 +580,12 @@ class ObjectDetectionNode(Node):
 
         except Exception as e:
             self.get_logger().error(f"Error in sync_callback: {str(e)}")
+
+
+    def destroy_node(self):
+        if self._det_logger is not None:
+            self._det_logger.close()
+        super().destroy_node()
 
 
 def main(args=None):
