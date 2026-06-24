@@ -11,7 +11,11 @@
     classes: [11, 24, 25, 39, 74]
 
     # --- detection / projection ---
-    model_method: "hdbscan"
+    # task: "" (or "auto") infers detect vs. segment from the ONNX metadata.
+    # Set "segment" to force a YOLO segmentation model: lidar points are then
+    # associated to an object by its instance mask instead of its bounding box.
+    task: ""
+    model_method: "mean"
     confident: 0.25                    # detection score threshold
     iou: 0.1                           # NMS IoU threshold (sim overrides to 0.0)
     project_object_points_to_image: true

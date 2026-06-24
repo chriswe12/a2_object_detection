@@ -6,6 +6,10 @@ import onnxruntime as rt
 import cv2  # Used for preprocessing and postprocessing using OpenCV
 
 
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
 class ObjectDetectorONNX:
     def __init__(self, config):
         self.architecture = config["architecture"]
@@ -17,7 +21,12 @@ class ObjectDetectorONNX:
         self.iou = config["iou"]
         self.classes = config["classes"]
         self.multiple_instance = config["multiple_instance"]
+        # "" / "auto" -> infer from the ONNX metadata; "detect"/"segment" force it.
+        self.task_override = (config.get("task") or "").lower()
         self.detector = None
+        # Set once the model is loaded: True for segmentation models, in which
+        # case detect() also returns one boolean instance mask per detection.
+        self.is_segment = False
         self.class_dict = {
             0: "person",
             1: "bicycle",
@@ -115,7 +124,28 @@ class ObjectDetectorONNX:
                 self.input_name = inp.name
                 self.input_dtype = np.float16 if "float16" in inp.type else np.float32
                 self.input_size = inp.shape[2]  # [1, 3, H, W]
-                print(f"[ObjectDetectorONNX] Loaded: {onnx_model_path} | input {self.input_size}px {inp.type} | output {self.session.get_outputs()[0].shape}", flush=True)
+
+                # Decide detect vs. segment. Ultralytics exports stamp the task
+                # in the ONNX metadata; an explicit override wins when given.
+                meta = self.session.get_modelmeta().custom_metadata_map
+                if self.task_override in ("detect", "segment"):
+                    task = self.task_override
+                else:
+                    task = (meta.get("task") or "detect").lower()
+                self.is_segment = task == "segment"
+
+                outs = self.session.get_outputs()
+                print(
+                    f"[ObjectDetectorONNX] Loaded: {onnx_model_path} | task {task} | "
+                    f"input {self.input_size}px {inp.type} | "
+                    f"outputs {[o.shape for o in outs]}",
+                    flush=True,
+                )
+                if self.is_segment and len(outs) < 2:
+                    raise ValueError(
+                        "Segmentation task selected but the ONNX model has a single "
+                        "output; expected a second mask-prototype output."
+                    )
             else:
                 raise ValueError("No model path defined for ONNX model.")
         elif self.architecture == "detectron":
@@ -163,32 +193,54 @@ class ObjectDetectorONNX:
         pad_left,
         input_size=1280,
         conf_threshold=0.5,
+        protos=None,
     ):
+        """Decode raw model output into a detection DataFrame.
+
+        Returns ``(df, masks)`` where ``masks`` is ``None`` for detection models
+        and an ``[N, H, W]`` boolean array (one instance mask per row, at the
+        original image resolution) for segmentation models.
+        """
         try:
             # Ensure detection is a numpy array
             if isinstance(detection, list):
                 detection = detection[0]
 
-            detection = detection[0]
+            detection = np.asarray(detection)
+            if detection.ndim == 3:
+                detection = detection[0]
 
-            # YOLO26 end2end output: [300, 6] = [x1, y1, x2, y2, conf, class_id], NMS done in model
-            if detection.shape[1] == 6:
+            # YOLO26 end2end output: [300, 6] = [x1, y1, x2, y2, conf, class_id],
+            # NMS done in model. Segmentation models append 32 mask coefficients:
+            # [300, 6 + nm] paired with a [nm, mh, mw] prototype tensor (protos).
+            if detection.shape[1] == 6 or (protos is not None and detection.shape[1] > 6):
                 mask = detection[:, 4] > conf_threshold
                 detection = detection[mask]
                 x1, y1, x2, y2 = detection[:, 0], detection[:, 1], detection[:, 2], detection[:, 3]
                 confidences = detection[:, 4]
                 class_indices = detection[:, 5].astype(int)
+                coeffs = detection[:, 6:] if protos is not None else None
                 if self.classes is not None and len(self.classes) > 0:
                     cm = np.isin(class_indices, self.classes)
                     x1, y1, x2, y2 = x1[cm], y1[cm], x2[cm], y2[cm]
                     confidences, class_indices = confidences[cm], class_indices[cm]
+                    if coeffs is not None:
+                        coeffs = coeffs[cm]
                 x1 = np.clip((x1 - pad_left) / scale, 0, original_width)
                 y1 = np.clip((y1 - pad_top) / scale, 0, original_height)
                 x2 = np.clip((x2 - pad_left) / scale, 0, original_width)
                 y2 = np.clip((y2 - pad_top) / scale, 0, original_height)
                 filtered_names = [self.class_dict.get(c, str(c)) for c in class_indices]
-                return pd.DataFrame({"xmin": x1, "ymin": y1, "xmax": x2, "ymax": y2,
-                                     "confidence": confidences, "class": class_indices, "name": filtered_names})
+                df = pd.DataFrame({"xmin": x1, "ymin": y1, "xmax": x2, "ymax": y2,
+                                   "confidence": confidences, "class": class_indices, "name": filtered_names})
+                masks = None
+                if coeffs is not None and len(coeffs) > 0:
+                    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+                    masks = self.build_masks(
+                        protos, coeffs, boxes_xyxy, scale, pad_top, pad_left,
+                        original_width, original_height,
+                    )
+                return df, masks
 
             if detection.shape[1] != 85:
                 raise ValueError("Detection tensor shape is incorrect.")
@@ -252,11 +304,79 @@ class ObjectDetectorONNX:
                 }
             )
 
-            return result_df
+            return result_df, None
 
         except Exception as e:
             print(f"An error occurred: {e}")
             raise
+
+    def build_masks(
+        self,
+        protos,
+        coeffs,
+        boxes_xyxy,
+        scale,
+        pad_top,
+        pad_left,
+        original_width,
+        original_height,
+    ):
+        """Turn mask prototypes + per-detection coefficients into instance masks.
+
+        Args:
+            protos: prototype tensor, ``[1, nm, mh, mw]`` or ``[nm, mh, mw]``
+            coeffs: ``[N, nm]`` mask coefficients (one row per detection)
+            boxes_xyxy: ``[N, 4]`` detection boxes in original image coords
+        Returns:
+            ``[N, original_height, original_width]`` boolean array; each mask is
+            cropped to its own bounding box so it can't bleed into neighbours.
+        """
+        protos = np.asarray(protos, dtype=np.float32)
+        if protos.ndim == 4:
+            protos = protos[0]
+        nm, mh, mw = protos.shape
+
+        # Linear combination of prototypes -> low-res mask logits in the
+        # letterboxed input space, then squash to [0, 1].
+        mask_logits = coeffs.astype(np.float32) @ protos.reshape(nm, -1)
+        mask_prob = _sigmoid(mask_logits).reshape(-1, mh, mw)
+
+        # Letterbox geometry used in preprocess(): the model input is the resized
+        # image (nh x nw) centred with constant padding (pad_top, pad_left).
+        input_size = self.input_size
+        nh = int(original_height * scale)
+        nw = int(original_width * scale)
+        top = int(pad_top)
+        left = int(pad_left)
+
+        masks = np.zeros(
+            (mask_prob.shape[0], original_height, original_width), dtype=bool
+        )
+        for i in range(mask_prob.shape[0]):
+            # Upscale prototype mask to the full padded input, strip the padding,
+            # then resize the valid region back to the original image size.
+            m = cv2.resize(
+                mask_prob[i], (input_size, input_size), interpolation=cv2.INTER_LINEAR
+            )
+            m = m[top : top + nh, left : left + nw]
+            if m.size == 0:
+                continue
+            m = cv2.resize(
+                m, (original_width, original_height), interpolation=cv2.INTER_LINEAR
+            )
+            binary = m > 0.5
+
+            # Crop to the detection box (standard ultralytics behaviour).
+            x1, y1, x2, y2 = boxes_xyxy[i]
+            x1 = max(int(np.floor(x1)), 0)
+            y1 = max(int(np.floor(y1)), 0)
+            x2 = min(int(np.ceil(x2)), original_width)
+            y2 = min(int(np.ceil(y2)), original_height)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            masks[i, y1:y2, x1:x2] = binary[y1:y2, x1:x2]
+
+        return masks
 
     def detect(self, image):
         if self.architecture == "yolo":
@@ -264,12 +384,32 @@ class ObjectDetectorONNX:
             input_image, scale, pad_top, pad_left = self.preprocess(image)
             outputs = self.session.run(None, {self.input_name: input_image})
 
-            detection = self.postprocess(
-                outputs, original_width, original_height, scale, pad_top, pad_left, conf_threshold=self.confident
+            # Segmentation models emit two tensors: a 3D detection tensor and a
+            # 4D mask-prototype tensor. Pick them out by rank so we don't depend
+            # on output ordering.
+            protos = None
+            detection_out = outputs
+            if self.is_segment:
+                detection_out = None
+                for out in outputs:
+                    arr = np.asarray(out)
+                    if arr.ndim == 4 and protos is None:
+                        protos = arr
+                    elif arr.ndim == 3 and detection_out is None:
+                        detection_out = arr
+                if detection_out is None:
+                    detection_out = outputs[0]
+
+            detection, masks = self.postprocess(
+                detection_out, original_width, original_height, scale, pad_top,
+                pad_left, conf_threshold=self.confident, protos=protos,
             )
 
             if not self.multiple_instance:
-                detection = self.filter_detection(detection)
+                keep = self.single_instance_indices(detection)
+                detection = detection.iloc[keep].reset_index(drop=True)
+                if masks is not None:
+                    masks = masks[keep]
 
             # Drawing the bounding boxes on the image
             for index, row in detection.iterrows():
@@ -290,18 +430,29 @@ class ObjectDetectorONNX:
                     2,
                 )
 
-            return detection, image
+            # Tint each instance mask onto the debug image (green overlay).
+            if masks is not None:
+                for m in masks:
+                    if m.any():
+                        image[m] = (0.5 * image[m] + 0.5 * np.array([0, 200, 0])).astype(
+                            image.dtype
+                        )
 
-    def filter_detection(self, detection):
-        detected_objects = []
-        row_to_delete = []
+            return detection, image, masks
+
+    def single_instance_indices(self, detection):
+        """Positional indices of the highest-confidence row per class.
+
+        Detections arrive sorted by confidence (NMS output), so keeping the
+        first occurrence of each class matches the previous drop behaviour while
+        returning indices we can also apply to the parallel mask array.
+        """
+        seen = set()
+        keep = []
         for i in range(len(detection)):
-            if detection["class"][i] in detected_objects:
-                row_to_delete.append(i)
-            else:
-                detected_objects.append(detection["class"][i])
-
-        detection = detection.drop(row_to_delete, axis=0)
-        detection.reset_index(inplace=True, drop=True)
-
-        return detection
+            cls = detection["class"].iloc[i]
+            if cls in seen:
+                continue
+            seen.add(cls)
+            keep.append(i)
+        return keep

@@ -66,6 +66,7 @@ class ObjectLocalizer:
 
         self.distance_estimator = self.estimate_dist_default
         self.id_dict = {}
+        self.masks = None
 
         if self.distance_estimator_type != "none":
             try:
@@ -100,18 +101,22 @@ class ObjectLocalizer:
             self.distance_estimator_save_data = False
             self.logger.info("No estimator will be used (estimator type is None)")
 
-    def set_scene(self, objects, points2D, points3D, image=None):
+    def set_scene(self, objects, points2D, points3D, image=None, masks=None):
         """Set the scene info such as objects, points2D, points3D, image.
 
         Args:
             objects     : 2D object detection results in Panda Dataframe
             points2D    : 2D Point cloud in camera frame on the image
             points3D    : 3D Point cloud in camera frame
+            masks       : Optional [N, H, W] boolean instance masks aligned with
+                          ``objects`` rows. When given, points are associated to
+                          an object by mask membership instead of its bounding box.
         """
         self.objects = objects
         self.points2D = points2D
         self.points3D = points3D
         self.image = image
+        self.masks = masks
 
     def set_intrinsic_camera_param(self, K):
         """Set intrinsic camera parameters.
@@ -284,6 +289,40 @@ class ObjectLocalizer:
             )
             return inside_BB, center_ind, center
 
+    def points_in_mask(self, index):
+        """Find points whose image projection falls inside the instance mask.
+
+        Args:
+            index: Index of the object / mask
+        Returns:
+            tuple: (point indices inside mask, center point index, BB center)
+        """
+        mask = self.masks[index]
+        h, w = mask.shape
+
+        px = self.points2D[:, 0].astype(np.int64)
+        py = self.points2D[:, 1].astype(np.int64)
+        in_frame = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+
+        inside = np.zeros(len(px), dtype=bool)
+        inside[in_frame] = mask[py[in_frame], px[in_frame]]
+        inside_mask = np.nonzero(inside)[0]
+
+        center = np.array(
+            [
+                (self.objects["xmin"][index] + self.objects["xmax"][index]) / 2.0,
+                (self.objects["ymin"][index] + self.objects["ymax"][index]) / 2.0,
+            ]
+        )
+
+        if len(inside_mask) == 0:
+            return np.array([NO_POSE]), NO_POSE, center
+
+        center_ind = np.argmin(
+            np.linalg.norm(self.points2D[inside_mask, :] - center, axis=1)
+        )
+        return inside_mask, center_ind, center
+
     def method_hdbscan(self, in_BB_3D, obj_class, estimated_dist):
         """Apply HDBSCAN clustering to find object points.
 
@@ -373,9 +412,26 @@ class ObjectLocalizer:
             id=new_obj_id, idx=index, pos=None, pt_indices=None, estimation_type=None
         )
 
-        in_BB_indices, center_ind, center = self.points_in_BB(index)
+        # Prefer mask membership when a segmentation mask is available; fall back
+        # to the bounding box if the mask captures no projected points.
+        use_mask = (
+            self.masks is not None
+            and index < len(self.masks)
+            and self.masks[index] is not None
+        )
+        if use_mask:
+            in_BB_indices, center_ind, center = self.points_in_mask(index)
+            if center_ind == NO_POSE:
+                in_BB_indices, center_ind, center = self.points_in_BB(index)
+                use_mask = False
+        else:
+            in_BB_indices, center_ind, center = self.points_in_BB(index)
 
-        if center_ind == NO_POSE or len(in_BB_indices) < self.min_cluster_size:
+        # Mask membership is trusted directly, so a single point is enough; the
+        # bounding-box path still needs a cluster's worth of points to be robust.
+        min_points = 1 if use_mask else self.min_cluster_size
+
+        if center_ind == NO_POSE or len(in_BB_indices) < min_points:
             if self.distance_estimator_type == "none":
                 new_obj.pt_indices = np.array([NO_POSE])
                 new_obj.pos = np.array([0, 0, NO_POSE])
@@ -388,7 +444,11 @@ class ObjectLocalizer:
         else:
             in_BB_3D = self.points3D[in_BB_indices, :]
 
-            if self.model_method == "hdbscan":
+            if use_mask:
+                # Segmentation already isolated the object in 2D, so take all
+                # masked points and use their mean (no extra clustering).
+                pos, on_object = np.mean(in_BB_3D, axis=0), np.arange(in_BB_3D.shape[0])
+            elif self.model_method == "hdbscan":
                 try:
                     estimated_dist = self.distance_estimator([index, obj_class])
                     pos, on_object = self.method_hdbscan(
@@ -431,7 +491,7 @@ class ObjectLocalizer:
 
         return new_obj
 
-    def localize(self, objects, points2D, points3D, image=None):
+    def localize(self, objects, points2D, points3D, image=None, masks=None):
         """Localize all detected objects in 3D space.
 
         Args:
@@ -439,10 +499,11 @@ class ObjectLocalizer:
             points2D: 2D point cloud in image frame
             points3D: 3D point cloud in camera frame
             image: Optional image data
+            masks: Optional [N, H, W] boolean instance masks aligned with objects
         Returns:
             list: List of DetectedObject instances
         """
-        self.set_scene(objects, points2D, points3D, image)
+        self.set_scene(objects, points2D, points3D, image, masks)
         self.id_dict = {}
         object_list = []
 

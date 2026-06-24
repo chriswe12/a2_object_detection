@@ -67,6 +67,7 @@ class ObjectDetectionNode(Node):
                 ("camera_lidar_sync_queue_size", 10),
                 ("camera_lidar_sync_slop", 0.05),
                 ("architecture", "yolo"),
+                ("task", ""),  # ""/"auto" -> infer from ONNX; "detect"/"segment" forces it
                 ("model", "yolov5n6"),
                 ("model_dir_path", ""),
                 ("device", "cpu"),
@@ -158,6 +159,7 @@ class ObjectDetectionNode(Node):
         self.object_detector = ObjectDetectorONNX(
             {
                 "architecture": self.get_parameter("architecture").value,
+                "task": self.get_parameter("task").value,
                 "model": self.get_parameter("model").value,
                 "model_dir_path": self.get_parameter("model_dir_path").value,
                 "device": self.get_parameter("device").value,
@@ -324,7 +326,7 @@ class ObjectDetectionNode(Node):
 
             # Detect objects
             infer_start = time.time()
-            object_detection_result, object_detection_image = (
+            object_detection_result, object_detection_image, object_masks = (
                 self.object_detector.detect(cv_image)
             )
             infer_ms = (time.time() - infer_start) * 1000
@@ -341,6 +343,7 @@ class ObjectDetectionNode(Node):
                 points_on_image,
                 point_cloud_xyz[in_fov_indices],
                 cv_image,
+                masks=object_masks,
             )
             # Create and publish results
             header = Header()
