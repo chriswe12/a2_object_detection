@@ -41,6 +41,28 @@ from object_detection.utils import *
 from ament_index_python.packages import get_package_share_directory
 
 
+class GlobalObject:
+    """A fused best-guess of one physical object's location in the map frame.
+
+    Repeated detections of the same class that land within the merge distance
+    are averaged into a single running estimate, so the published object map
+    stays stable as the robot re-observes things from different viewpoints.
+    """
+
+    def __init__(self, obj_id, name, position, confidence):
+        self.id = obj_id
+        self.name = name
+        self.position = position  # np.array([x, y, z]) in the map frame
+        self.count = 1            # number of fused observations
+        self.confidence = confidence
+
+    def update(self, position, confidence):
+        self.count += 1
+        # Incremental mean — equal weight per observation.
+        self.position = self.position + (position - self.position) / self.count
+        self.confidence = max(self.confidence, confidence)
+
+
 class ObjectDetectionNode(Node):
     def __init__(self):
         super().__init__("object_detection_node")
@@ -83,8 +105,14 @@ class ObjectDetectionNode(Node):
                 ("cluster_selection_epsilon", 0.08),
                 ("max_object_depth", 0.25),
                 ("classes", [11, 24, 25, 39, 74]),
-                ("log_detections", False),
+                ("log_detections", True),
                 ("log_file_path", ""),
+                # --- global "best guess" object map (odometry-anchored) ---
+                ("publish_global_objects", True),
+                ("map_frame", "map"),
+                ("object_merge_distance", 1.0),
+                ("global_object_markers_topic", "global_object_markers"),
+                ("global_object_info_topic", "global_detection_info"),
             ],
         )
 
@@ -120,6 +148,19 @@ class ObjectDetectionNode(Node):
         )
 
         self.marker_pub = self.create_publisher(MarkerArray, "object_markers", 10)
+
+        # Persistent best-guess object map, anchored in the odometry/map frame.
+        self.map_frame = self.get_parameter("map_frame").value
+        self.global_marker_pub = self.create_publisher(
+            MarkerArray, self.get_parameter("global_object_markers_topic").value, 10
+        )
+        self.global_info_pub = self.create_publisher(
+            ObjectDetectionInfoArray,
+            self.get_parameter("global_object_info_topic").value,
+            10,
+        )
+        self.global_objects = []
+        self._global_id_counter = 0
 
         # ---------- Setup subscribers ----------
         qos_profile = QoSProfile(
@@ -350,6 +391,11 @@ class ObjectDetectionNode(Node):
             header.stamp = image_msg.header.stamp
             header.frame_id = self.optical_frame_id
 
+            # Odometry-anchored transform for this frame (optical -> map). Looked
+            # up once and reused for both the per-detection map position and the
+            # fused global object map. (None when TF is unavailable.)
+            R_map, t_map = self._lookup_map_transform(header.stamp)
+
             object_pose_array = PoseArray(header=header)
             object_info_array = ObjectDetectionInfoArray(header=header)
             point_cloud_array = PointCloudArray(header=header)
@@ -417,6 +463,12 @@ class ObjectDetectionNode(Node):
                 score = float(object_detection_result["confidence"][i])
 
                 if self._det_logger is not None:
+                    # Single-frame "best guess" in the map frame (no averaging).
+                    point_map = None
+                    if R_map is not None:
+                        point_map = R_map @ np.array(
+                            [float(obj.pos[0]), float(obj.pos[1]), float(obj.pos[2])]
+                        ) + t_map
                     self._det_logger.log_detection(
                         stamp=image_msg.header.stamp,
                         class_id=cls,
@@ -425,6 +477,8 @@ class ObjectDetectionNode(Node):
                         bbox=[xmin, ymin, xmax, ymax],
                         camera_frame=self.optical_frame_id,
                         estimation_type=str(obj.estimation_type),
+                        point_map=point_map,
+                        map_frame=self.map_frame,
                     )
 
                 # Foxglove annotation: bounding box (LINE_LOOP) + label text
@@ -574,6 +628,12 @@ class ObjectDetectionNode(Node):
                 det_img_msg.header.frame_id = self.optical_frame_id
             self.object_detection_img_pub.publish(det_img_msg)
 
+            # Fuse this frame's localized objects into the map-frame best-guess
+            # store and (re)publish it for RViz.
+            self.update_global_objects(
+                object_list, object_detection_result, header, R_map, t_map
+            )
+
             total_ms = (time.time() - start_time) * 1000
             fps = 1000.0 / total_ms if total_ms > 0 else 0.0
             self.get_logger().info(
@@ -584,6 +644,145 @@ class ObjectDetectionNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error in sync_callback: {str(e)}")
 
+
+    def _lookup_map_transform(self, stamp):
+        """Return (R, t) mapping a point from the optical frame to the map frame.
+
+        Uses the message stamp first (correct odometry pose for this frame) and
+        falls back to the latest available transform if that one is unavailable.
+        Returns (None, None) when no transform can be found.
+        """
+        for query in (rclpy.time.Time.from_msg(stamp), rclpy.time.Time()):
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.map_frame, self.optical_frame_id, query
+                )
+            except TransformException:
+                continue
+            tr = np.array([
+                tf.transform.translation.x,
+                tf.transform.translation.y,
+                tf.transform.translation.z,
+            ])
+            q = [
+                tf.transform.rotation.x,
+                tf.transform.rotation.y,
+                tf.transform.rotation.z,
+                tf.transform.rotation.w,
+            ]
+            return Rotation.from_quat(q).as_matrix(), tr
+
+        self.get_logger().warn(
+            f"No transform {self.map_frame} <- {self.optical_frame_id}; "
+            "global object map not updated.",
+            throttle_duration_sec=2.0,
+        )
+        return None, None
+
+    def update_global_objects(self, object_list, detection_result, header, R, t):
+        """Transform localized objects into the map frame and fuse them in.
+
+        Reuses the optical->map transform (R, t) already looked up for this
+        frame; does nothing when it was unavailable.
+        """
+        if not self.get_parameter("publish_global_objects").value:
+            return
+        if R is None:
+            return
+
+        merge_distance = self.get_parameter("object_merge_distance").value
+        for i, obj in enumerate(object_list):
+            # Only fuse real lidar measurements; bbox-only distance estimates and
+            # un-localized detections (z == -1) carry no reliable 3D position.
+            if obj.estimation_type != "measurement":
+                continue
+
+            pos_optical = np.array(
+                [float(obj.pos[0]), float(obj.pos[1]), float(obj.pos[2])]
+            )
+            pos_map = R @ pos_optical + t
+            name = str(detection_result["name"][i])
+            confidence = float(detection_result["confidence"][i])
+            self._merge_global_object(name, pos_map, confidence, merge_distance)
+
+        self._publish_global_objects(header.stamp)
+
+    def _merge_global_object(self, name, position, confidence, merge_distance):
+        """Associate a detection with an existing best-guess or start a new one."""
+        match = None
+        best_distance = merge_distance
+        for g in self.global_objects:
+            if g.name != name:
+                continue
+            distance = np.linalg.norm(g.position - position)
+            if distance < best_distance:
+                best_distance = distance
+                match = g
+
+        if match is None:
+            self._global_id_counter += 1
+            self.global_objects.append(
+                GlobalObject(self._global_id_counter, name, position.copy(), confidence)
+            )
+        else:
+            match.update(position, confidence)
+
+    def _publish_global_objects(self, stamp):
+        """Publish the full best-guess object map as markers + detection info."""
+        marker_array = MarkerArray()
+        clear = Marker()
+        clear.header.frame_id = self.map_frame
+        clear.header.stamp = stamp
+        clear.action = Marker.DELETEALL
+        marker_array.markers.append(clear)
+
+        info_array = ObjectDetectionInfoArray()
+        info_array.header.frame_id = self.map_frame
+        info_array.header.stamp = stamp
+
+        for k, g in enumerate(self.global_objects):
+            c255 = CLASS_COLOR.get(g.name, (255, 255, 0))
+            color = (c255[0] / 255.0, c255[1] / 255.0, c255[2] / 255.0)
+
+            sphere = marker_(
+                ns="global_objects",
+                marker_id=k * 2,
+                pos=[float(g.position[0]), float(g.position[1]), float(g.position[2])],
+                stamp=stamp,
+                color=color,
+                frame_id=self.map_frame,
+            )
+            sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.3
+            marker_array.markers.append(sphere)
+
+            label = Marker()
+            label.header.frame_id = self.map_frame
+            label.header.stamp = stamp
+            label.ns = "global_object_labels"
+            label.id = k * 2 + 1
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = float(g.position[0])
+            label.pose.position.y = float(g.position[1])
+            label.pose.position.z = float(g.position[2]) + 0.3
+            label.pose.orientation.w = 1.0
+            label.scale.z = 0.25
+            label.color.r = label.color.g = label.color.b = label.color.a = 1.0
+            label.text = f"{g.name} #{g.id} ({g.count})"
+            marker_array.markers.append(label)
+
+            info = ObjectDetectionInfo()
+            info.class_id = g.name
+            info.id = int(g.id)
+            info.position.x = float(g.position[0])
+            info.position.y = float(g.position[1])
+            info.position.z = float(g.position[2])
+            info.confidence = float(g.confidence)
+            info.pose_estimation_type = "global"
+            info_array.info.append(info)
+
+        self.global_marker_pub.publish(marker_array)
+        self.global_info_pub.publish(info_array)
 
     def destroy_node(self):
         if self._det_logger is not None:

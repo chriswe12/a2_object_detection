@@ -1,7 +1,31 @@
 #!/usr/bin/env python3
 import json
 import os
+import uuid
 from datetime import datetime
+
+
+def _default_log_path() -> str:
+    """A unique JSONL path inside the persisted bags volume.
+
+    Logs land in a `object_detections/` subfolder of the bags directory so they
+    survive container restarts (unlike the container-local home dir). Falls back
+    to the workspace/home bags dir, then ~, when the volume isn't mounted.
+    """
+    bags_dir = os.environ.get("ROS_BAGS_DIR")
+    if not bags_dir:
+        for candidate in ("/a2_ros_ws/bags", "/a2_ros/bags"):
+            if os.path.isdir(candidate):
+                bags_dir = candidate
+                break
+    if not bags_dir:
+        bags_dir = os.path.expanduser("~")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique = uuid.uuid4().hex[:6]
+    return os.path.join(
+        bags_dir, "object_detections", f"object_detections_{stamp}_{unique}.jsonl"
+    )
 
 
 class DetectionLogger:
@@ -17,8 +41,7 @@ class DetectionLogger:
 
     def __init__(self, file_path: str = ""):
         if not file_path:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            file_path = f"~/object_detections_{ts}.jsonl"
+            file_path = _default_log_path()
         # Resolve ~ and make relative paths land in home, not the node's cwd.
         file_path = os.path.expanduser(file_path)
         if not os.path.isabs(file_path):
@@ -56,6 +79,8 @@ class DetectionLogger:
         bbox,
         camera_frame: str,
         estimation_type: str,
+        point_map=None,
+        map_frame: str = None,
     ) -> None:
         """Append one detection record.
 
@@ -67,12 +92,16 @@ class DetectionLogger:
             bbox: [xmin, ymin, xmax, ymax] in pixels.
             camera_frame: TF frame id of the camera (needed for post TF lookup).
             estimation_type: "measurement" | "estimation" | "none".
+            point_map: optional [X, Y, Z] in the map frame for this single frame
+                (the odometry "best guess" used live, with no cross-frame
+                averaging). None when the map transform was unavailable.
+            map_frame: TF frame id the point_map is expressed in.
         """
         # Drop detections with no valid pose (sentinel pos[2] == -1).
         if point_cam[2] < 0:
             return
         timestamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
-        self._write({
+        record = {
             "type": "detection",
             "timestamp_ns": timestamp_ns,
             "camera_frame": camera_frame,
@@ -81,7 +110,11 @@ class DetectionLogger:
             "point_cam": [float(v) for v in point_cam],
             "bbox": [int(v) for v in bbox],
             "estimation_type": estimation_type,
-        })
+        }
+        if point_map is not None:
+            record["point_map"] = [float(v) for v in point_map]
+            record["map_frame"] = map_frame
+        self._write(record)
 
     def close(self) -> None:
         self._f.close()

@@ -40,8 +40,15 @@
     object_specific_file: "object_specific.yaml"
 
     # --- detection logging (post-mission SLAM fusion) ---
-    log_detections: false          # set true on real missions to write JSONL log
-    log_file_path: ""              # empty → ~/object_detections_<timestamp>.jsonl
+    log_detections: true           # write per-detection JSONL log (cam + map frame)
+    log_file_path: ""              # empty → <bags>/object_detections/object_detections_<ts>_<id>.jsonl
+
+    # --- global "best guess" object map (odometry-anchored) ---
+    # Each localized detection is transformed into map_frame via TF and fused
+    # into a persistent per-object estimate, republished for RViz.
+    publish_global_objects: true
+    map_frame: "map"               # fixed frame the object map is stored in
+    object_merge_distance: 1.0     # m; same-class detections within this merge
 
     # --- output topic names ---
     object_detection_pose_topic: "object_positions"
