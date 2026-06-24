@@ -45,7 +45,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "object_detection_classes",
-            default_value="[0,24,25,28,32,39,41,45,46,47,56]",
+            default_value="[11, 24, 25, 39, 74]",
             description="List of the ids of classes for detection (COCO dataset)",
         ),
         DeclareLaunchArgument(

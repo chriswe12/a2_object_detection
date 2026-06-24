@@ -80,9 +80,11 @@ class ObjectDetectionNode(Node):
                 ("min_cluster_size", 5),
                 ("cluster_selection_epsilon", 0.08),
                 ("max_object_depth", 0.25),
-                ("classes", [40, 41, 42]),
+                ("classes", [11, 24, 25, 39, 74]),
             ],
         )
+
+        all_coco_ids = self.get_parameter("classes").value
 
         # ---------- Setup publishers ----------
         self.object_pose_pub = self.create_publisher(
@@ -159,7 +161,7 @@ class ObjectDetectionNode(Node):
                 "confident": self.get_parameter("confident").value,
                 "iou": self.get_parameter("iou").value,
                 "checkpoint": None,
-                "classes": self.get_parameter("classes").value,
+                "classes": all_coco_ids,
                 "multiple_instance": False,
             },
         )
@@ -194,6 +196,8 @@ class ObjectDetectionNode(Node):
         # ---------- Initialize components ----------
         self.image_reader = CvBridge()
         self.image_info_received = False
+        self._K = None
+        self._dist_coeffs = None
 
         self.get_logger().info(
             "[ObjectDetection Node] Object Detector initilization done."
@@ -218,7 +222,9 @@ class ObjectDetectionNode(Node):
         K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
 
         if check_validity_image_info(K, w, h):
-            self.point_projector.set_intrinsic_params(K, [w, h])
+            self._K = K
+            self._dist_coeffs = np.array(msg.d, dtype=np.float64) if msg.d else None
+            self.point_projector.set_intrinsic_params(K, [w, h], self._dist_coeffs)
             self.object_localizer.set_intrinsic_camera_param(K)
             self.optical_frame_id = msg.header.frame_id
             self.get_logger().info(
@@ -256,7 +262,9 @@ class ObjectDetectionNode(Node):
             return
 
         try:
-            # Read message
+            # Read message — keep raw distorted image so YOLO bounding boxes are
+            # in distorted pixel space. LiDAR projection applies the same distortion
+            # model (via PointProjector), so the two align without any information loss.
             cv_image = self.image_reader.imgmsg_to_cv2(image_msg, "bgr8")
 
             point_cloud_xyz = pointcloud2_to_xyz_array(lidar_msg)

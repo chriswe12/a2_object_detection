@@ -6,6 +6,10 @@
 # The "/**" wildcard applies to the node regardless of its launch name.
 /**:
   ros__parameters:
+    # --- target classes (COCO IDs) ---
+    # 11=stop sign, 24=backpack, 25=umbrella, 39=bottle, 74=clock
+    classes: [11, 24, 25, 39, 74]
+
     # --- detection / projection ---
     model_method: "hdbscan"
     confident: 0.5                     # detection score threshold
