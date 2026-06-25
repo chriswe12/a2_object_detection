@@ -64,7 +64,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "log_detections",
-            default_value="false",
+            default_value="true",
             description="Write a JSONL detection log for post-mission SLAM fusion",
             choices=["true", "false"],
         ),
@@ -72,6 +72,14 @@ def generate_launch_description():
             "log_file_path",
             default_value="",
             description="Path for the JSONL log (empty = ~/object_detections_<timestamp>.jsonl)",
+        ),
+        DeclareLaunchArgument(
+            "use_sim_time",
+            default_value="false",
+            description="Use /clock (bag time) instead of wall time. MUST be true "
+            "when replaying a bag, or the deferred map-frame fusion ages every "
+            "detection out and no global object map is written.",
+            choices=["true", "false"],
         ),
     ]
 
@@ -112,6 +120,9 @@ def generate_launch_description():
                         ["'", LaunchConfiguration("log_detections"), "' == 'true'"]
                     )},
                     {"log_file_path": LaunchConfiguration("log_file_path")},
+                    {"use_sim_time": PythonExpression(
+                        ["'", LaunchConfiguration("use_sim_time"), "' == 'true'"]
+                    )},
                 ],
             )
         ]

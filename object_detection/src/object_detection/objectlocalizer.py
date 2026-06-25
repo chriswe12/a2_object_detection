@@ -63,6 +63,14 @@ class ObjectLocalizer:
         # Depth slice (m) kept around the chosen cluster's front; falls back to
         # the module default when not supplied.
         self.max_object_depth = config.get("max_object_depth", DEFAULT_MAX_OBJECT_DEPTH)
+        # Absolute range gate (m, camera-forward depth). A localized position
+        # whose depth falls outside [min, max] is treated as a failed estimate,
+        # not a measurement: clustering picks the nearest cluster, but if the
+        # only lidar in the box is a far wall behind a small/distant detection,
+        # that wall *is* the nearest cluster -- this rejects it so it never
+        # reaches the global map.
+        self.min_localization_range = config.get("min_localization_range", 0.3)
+        self.max_localization_range = config.get("max_localization_range", 10.0)
 
         self.distance_estimator = self.estimate_dist_default
         self.id_dict = {}
@@ -444,11 +452,13 @@ class ObjectLocalizer:
         else:
             in_BB_3D = self.points3D[in_BB_indices, :]
 
-            if use_mask:
-                # Segmentation already isolated the object in 2D, so take all
-                # masked points and use their mean (no extra clustering).
-                pos, on_object = np.mean(in_BB_3D, axis=0), np.arange(in_BB_3D.shape[0])
-            elif self.model_method == "hdbscan":
+            if self.model_method == "hdbscan":
+                # Cluster in depth to isolate the object's surface and reject
+                # background, whether the points came from the instance mask or
+                # the bounding box. A mask separates the object in 2D, but lidar
+                # points on a wall behind a thin/distant object still project
+                # inside it; averaging those in is what produced the 10-60 m
+                # depth outliers, so masked points are clustered too.
                 try:
                     estimated_dist = self.distance_estimator([index, obj_class])
                     pos, on_object = self.method_hdbscan(
@@ -480,6 +490,21 @@ class ObjectLocalizer:
                 pos[AXIS_Z] / center_point[AXIS_Z]
             )
             pos[[AXIS_X, AXIS_Y]] = center_point[[AXIS_X, AXIS_Y]]
+
+            # Range gate: reject implausible depths (e.g. a far wall behind a
+            # small/distant detection) so they aren't fused into the global map.
+            depth = pos[AXIS_Z]
+            if not (self.min_localization_range <= depth <= self.max_localization_range):
+                self.logger.warn(
+                    f"{obj_class} localized at {depth:.1f} m, outside "
+                    f"[{self.min_localization_range}, {self.max_localization_range}] m "
+                    "-- rejecting as a measurement.",
+                    throttle_duration_sec=2.0,
+                )
+                new_obj.pt_indices = np.array([NO_POSE])
+                new_obj.pos = np.array([0, 0, NO_POSE])
+                new_obj.estimation_type = "none"
+                return new_obj
 
             new_obj.pt_indices = (
                 np.array([in_BB_indices[on_object]])

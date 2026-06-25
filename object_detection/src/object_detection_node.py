@@ -2,6 +2,8 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import numpy as np
 from sensor_msgs_py import point_cloud2
@@ -112,6 +114,10 @@ class ObjectDetectionNode(Node):
                 ("min_cluster_size", 5),
                 ("cluster_selection_epsilon", 0.08),
                 ("max_object_depth", 0.25),
+                # Absolute depth gate (m) for a localized object; outside this it
+                # is rejected as a measurement (not fused into the global map).
+                ("min_localization_range", 0.3),
+                ("max_localization_range", 10.0),
                 ("classes", [11, 24, 25, 39, 74]),
                 ("log_detections", True),
                 ("log_file_path", ""),
@@ -196,13 +202,26 @@ class ObjectDetectionNode(Node):
             depth=10,
         )
 
+        # The image+lidar sync callback runs YOLO (hundreds of ms). Put it (and the
+        # deferred-fusion drain timer) in a dedicated mutually-exclusive group so,
+        # under a MultiThreadedExecutor (see main), the TF subscriptions stay in the
+        # default group and keep filling the buffer on another thread *during*
+        # inference. Without this, a single-threaded executor can't service /tf
+        # while YOLO blocks, so poses for that frame's stamp can be missing/stale by
+        # the time we look them up. Keeping sync_callback + drain in one group means
+        # they never run concurrently, so self._pending needs no lock.
+        self.cb_heavy = MutuallyExclusiveCallbackGroup()
+
         camera_topic = self.get_parameter("camera_topic").value
-        self.camera_sub = Subscriber(self, Image, camera_topic)
+        self.camera_sub = Subscriber(
+            self, Image, camera_topic, callback_group=self.cb_heavy
+        )
         self.lidar_sub = Subscriber(
             self,
             PointCloud2,
             self.get_parameter("lidar_topic").value,
             qos_profile=qos_profile,
+            callback_group=self.cb_heavy,
         )
 
         # ---------- Setup synchronizer ----------
@@ -217,13 +236,18 @@ class ObjectDetectionNode(Node):
         self.config_dir = join(get_package_share_directory("object_detection"), "cfg")
 
         # ---------- Setup TF ----------
-        # spin_thread=True gives the listener its own executor thread so the TF
-        # buffer keeps filling even while the main thread is busy with YOLO
-        # inference, so the deferred-resolution timer always sees fresh poses.
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(
-            self.tf_buffer, self, spin_thread=True
-        )
+        # The listener's /tf + /tf_static subscriptions stay in the node's default
+        # callback group (NOT cb_heavy), so under the MultiThreadedExecutor they run
+        # on a separate thread from YOLO and the buffer keeps filling during
+        # inference. We deliberately do NOT use spin_thread=True: that adds the whole
+        # node to a second executor while main() also spins it, double-running every
+        # callback. The executor + callback groups are the rclpy-idiomatic way.
+        #
+        # Large cache so a frame whose drain is delayed by inference backlog still
+        # finds the poses bracketing its stamp (default is only 10 s; a slow run can
+        # lag further than that and silently drop the map position).
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=120.0))
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # ---------- Deferred map-frame fusion ----------
         # Detections wait here (in arrival order) until the odometry pose at
@@ -235,9 +259,12 @@ class ObjectDetectionNode(Node):
         self.map_tf_max_wait = Duration(
             seconds=float(self.get_parameter("map_tf_max_wait").value)
         )
+        # Same group as sync_callback: the drain mutates self._pending, which
+        # sync_callback appends to, so serializing them avoids a data race.
         self.create_timer(
             float(self.get_parameter("map_tf_poll_period").value),
             self._drain_pending,
+            callback_group=self.cb_heavy,
         )
 
         # ---------- Setup PointProjector ----------
@@ -282,6 +309,12 @@ class ObjectDetectionNode(Node):
                     "cluster_selection_epsilon"
                 ).value,
                 "max_object_depth": self.get_parameter("max_object_depth").value,
+                "min_localization_range": self.get_parameter(
+                    "min_localization_range"
+                ).value,
+                "max_localization_range": self.get_parameter(
+                    "max_localization_range"
+                ).value,
             },
             self.config_dir,
         )
@@ -302,11 +335,17 @@ class ObjectDetectionNode(Node):
         )
 
         # ---------- Check camera info ----------
+        # cb_heavy (not the default group) so this callback — which sets the
+        # intrinsics, reconfigures the projector/localizer, and creates the logger —
+        # stays serialized with sync_callback/drain that read them. Default group is
+        # then exclusively the TF listener, which is what we want filling during
+        # inference.
         self.camera_info_sub = self.create_subscription(
             CameraInfo,
             self.get_parameter("camera_info_topic").value,
             self.image_info_callback,
             10,
+            callback_group=self.cb_heavy,
         )
 
     def image_info_callback(self, msg):
@@ -332,8 +371,9 @@ class ObjectDetectionNode(Node):
                 self._det_logger = DetectionLogger(log_path)
                 self._det_logger.log_metadata(K, w, h, msg.header.frame_id)
                 self.get_logger().info(
-                    f"[ObjectDetection] Logging detections to {self._det_logger.path}, "
-                    f"global objects to {self._det_logger.global_path}"
+                    f"[ObjectDetection] Logging detections to {self._det_logger.path}; "
+                    f"global objects to {self._det_logger.global_path} / "
+                    f"{self._det_logger.global_csv_path}"
                 )
         else:
             self.get_logger().error(
@@ -795,6 +835,19 @@ class ObjectDetectionNode(Node):
         if not self._pending:
             return
         now = self.get_clock().now()
+        # Sanity check the clock domain: if the node clock and the detection
+        # stamps differ by minutes, we're almost certainly on wall time while the
+        # data is bag time (use_sim_time not set during replay). Everything would
+        # then instantly age out below and the global object map would stay empty.
+        skew_s = (now - rclpy.time.Time.from_msg(self._pending[0]["stamp"])).nanoseconds / 1e9
+        if abs(skew_s) > 60.0:
+            self.get_logger().warn(
+                f"Node clock is {skew_s:.0f}s off the detection stamps -- likely "
+                "use_sim_time is false while replaying a bag. Map-frame fusion "
+                "will age out and NO global object map will be written. Launch "
+                "object detection with use_sim_time:=true.",
+                throttle_duration_sec=10.0,
+            )
         while self._pending:
             rec = self._pending[0]
             query = rclpy.time.Time.from_msg(rec["stamp"])
@@ -950,15 +1003,27 @@ class ObjectDetectionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
 
+    # MultiThreadedExecutor so the TF subscriptions (default callback group) keep
+    # filling the buffer on another thread while the YOLO sync_callback + drain
+    # timer (cb_heavy) run serialized. Single-threaded spin would block /tf for the
+    # whole inference, leaving frames without their map pose.
+    node = None
+    executor = MultiThreadedExecutor()
     try:
         node = ObjectDetectionNode()
-        rclpy.spin(node)
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
-        node.get_logger().info("Shutting down")
+        if node is not None:
+            node.get_logger().info("Shutting down")
     except Exception as e:
-        node.get_logger().fatal(f"Fatal error: {str(e)}")
+        if node is not None:
+            node.get_logger().fatal(f"Fatal error: {str(e)}")
+        else:
+            raise
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         rclpy.shutdown()
 
 

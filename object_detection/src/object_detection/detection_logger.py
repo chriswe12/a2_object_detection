@@ -5,6 +5,13 @@ import uuid
 from datetime import datetime
 
 
+def _unique_log_filename() -> str:
+    """A timestamped, collision-resistant JSONL filename (no directory)."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique = uuid.uuid4().hex[:6]
+    return f"object_detections_{stamp}_{unique}.jsonl"
+
+
 def _default_log_path() -> str:
     """A unique JSONL path inside the persisted bags volume.
 
@@ -21,11 +28,7 @@ def _default_log_path() -> str:
     if not bags_dir:
         bags_dir = os.path.expanduser("~")
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    unique = uuid.uuid4().hex[:6]
-    return os.path.join(
-        bags_dir, "object_detections", f"object_detections_{stamp}_{unique}.jsonl"
-    )
+    return os.path.join(bags_dir, "object_detections", _unique_log_filename())
 
 
 class DetectionLogger:
@@ -46,9 +49,15 @@ class DetectionLogger:
         file_path = os.path.expanduser(file_path)
         if not os.path.isabs(file_path):
             file_path = os.path.join(os.path.expanduser("~"), file_path)
+        # If a directory (or trailing-slash path) was given, drop a uniquely
+        # named jsonl inside it rather than trying to open the dir as a file
+        # (which raises "Is a directory"). Lets log_file_path point at a folder.
+        if os.path.isdir(file_path) or file_path.endswith(os.sep):
+            file_path = os.path.join(file_path, _unique_log_filename())
         self._path = file_path
         base, _ = os.path.splitext(self._path)
         self._global_path = base + "_global.json"
+        self._global_csv_path = base + "_global.csv"
         parent = os.path.dirname(self._path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -145,9 +154,27 @@ class DetectionLogger:
         with open(self._global_path, "w") as f:
             _json.dump(data, f, indent=2)
 
+        # Companion CSV with just class + position, for easy spreadsheet/plotting
+        # use. Overwritten in lockstep with the JSON.
+        import csv as _csv
+        with open(self._global_csv_path, "w", newline="") as f:
+            writer = _csv.writer(f)
+            writer.writerow(["class", "x", "y", "z"])
+            for g in global_objects:
+                writer.writerow([
+                    g.name,
+                    float(g.position[0]),
+                    float(g.position[1]),
+                    float(g.position[2]),
+                ])
+
     @property
     def global_path(self) -> str:
         return self._global_path
+
+    @property
+    def global_csv_path(self) -> str:
+        return self._global_csv_path
 
     def close(self) -> None:
         self._f.close()
