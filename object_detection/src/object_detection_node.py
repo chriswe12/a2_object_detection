@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import numpy as np
 from sensor_msgs_py import point_cloud2
 import time
 import cv2
 from os.path import join
+from collections import deque
 from numpy.lib.recfunctions import unstructured_to_structured
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
@@ -110,6 +112,16 @@ class ObjectDetectionNode(Node):
                 # --- global "best guess" object map (odometry-anchored) ---
                 ("publish_global_objects", True),
                 ("map_frame", "map"),
+                # Map-frame fusion is deferred: each frame's detections are
+                # queued and resolved against the odometry pose at their *exact*
+                # stamp once it is available (tf2 interpolates between the two
+                # surrounding poses), so nothing is dropped because the pose
+                # hadn't arrived yet. This is the longest a frame waits in that
+                # queue for its pose before we give up on its map position (the
+                # detection is still logged). Keep it below the TF buffer cache.
+                ("map_tf_max_wait", 2.0),
+                # How often (s) the deferred-resolution timer runs.
+                ("map_tf_poll_period", 0.05),
                 ("object_merge_distance", 1.0),
                 ("global_object_markers_topic", "global_object_markers"),
                 ("global_object_info_topic", "global_detection_info"),
@@ -190,8 +202,28 @@ class ObjectDetectionNode(Node):
         self.config_dir = join(get_package_share_directory("object_detection"), "cfg")
 
         # ---------- Setup TF ----------
+        # spin_thread=True gives the listener its own executor thread so the TF
+        # buffer keeps filling even while the main thread is busy with YOLO
+        # inference, so the deferred-resolution timer always sees fresh poses.
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_listener = TransformListener(
+            self.tf_buffer, self, spin_thread=True
+        )
+
+        # ---------- Deferred map-frame fusion ----------
+        # Detections wait here (in arrival order) until the odometry pose at
+        # their stamp is available; a timer drains them. This decouples the
+        # map-frame position from when the pose arrives, so no frame is dropped
+        # for being ahead of the SLAM estimate, and every frame gets the exact
+        # interpolated pose rather than whatever happened to be latest.
+        self._pending = deque()
+        self.map_tf_max_wait = Duration(
+            seconds=float(self.get_parameter("map_tf_max_wait").value)
+        )
+        self.create_timer(
+            float(self.get_parameter("map_tf_poll_period").value),
+            self._drain_pending,
+        )
 
         # ---------- Setup PointProjector ----------
         self.point_projector = PointProjector(self)
@@ -400,10 +432,10 @@ class ObjectDetectionNode(Node):
             header.stamp = image_msg.header.stamp
             header.frame_id = self.optical_frame_id
 
-            # Odometry-anchored transform for this frame (optical -> map). Looked
-            # up once and reused for both the per-detection map position and the
-            # fused global object map. (None when TF is unavailable.)
-            R_map, t_map = self._lookup_map_transform(header.stamp)
+            # Map-frame data (logging + global fusion) is resolved later by
+            # _drain_pending, once the odometry pose at this stamp is available.
+            # We collect just what that step needs per detection here.
+            pending_items = []
 
             object_pose_array = PoseArray(header=header)
             object_info_array = ObjectDetectionInfoArray(header=header)
@@ -471,24 +503,18 @@ class ObjectDetectionNode(Node):
                 cls = str(object_detection_result["name"][i])
                 score = float(object_detection_result["confidence"][i])
 
-                if self._det_logger is not None:
-                    # Single-frame "best guess" in the map frame (no averaging).
-                    point_map = None
-                    if R_map is not None:
-                        point_map = R_map @ np.array(
-                            [float(obj.pos[0]), float(obj.pos[1]), float(obj.pos[2])]
-                        ) + t_map
-                    self._det_logger.log_detection(
-                        stamp=image_msg.header.stamp,
-                        class_id=cls,
-                        confidence=score,
-                        point_cam=obj.pos,
-                        bbox=[xmin, ymin, xmax, ymax],
-                        camera_frame=self.optical_frame_id,
-                        estimation_type=str(obj.estimation_type),
-                        point_map=point_map,
-                        map_frame=self.map_frame,
-                    )
+                # Defer the map-frame position (log + global fusion) until the
+                # odometry pose at this stamp is available. Keep the minimal data
+                # the deferred step needs.
+                pending_items.append({
+                    "name": cls,
+                    "confidence": score,
+                    "point_cam": np.array(
+                        [float(obj.pos[0]), float(obj.pos[1]), float(obj.pos[2])]
+                    ),
+                    "bbox": [xmin, ymin, xmax, ymax],
+                    "estimation_type": str(obj.estimation_type),
+                })
 
                 # Foxglove annotation: bounding box (LINE_LOOP) + label text
                 box_ann = PointsAnnotation()
@@ -637,11 +663,13 @@ class ObjectDetectionNode(Node):
                 det_img_msg.header.frame_id = self.optical_frame_id
             self.object_detection_img_pub.publish(det_img_msg)
 
-            # Fuse this frame's localized objects into the map-frame best-guess
-            # store and (re)publish it for RViz.
-            self.update_global_objects(
-                object_list, object_detection_result, header, R_map, t_map
-            )
+            # Queue this frame's detections for map-frame logging + fusion. The
+            # timer resolves them against the odometry pose at header.stamp once
+            # it is available, so they're never dropped for being ahead of it.
+            if pending_items:
+                self._pending.append(
+                    {"stamp": header.stamp, "items": pending_items}
+                )
 
             total_ms = (time.time() - start_time) * 1000
             fps = 1000.0 / total_ms if total_ms > 0 else 0.0
@@ -654,67 +682,103 @@ class ObjectDetectionNode(Node):
             self.get_logger().error(f"Error in sync_callback: {str(e)}")
 
 
-    def _lookup_map_transform(self, stamp):
-        """Return (R, t) mapping a point from the optical frame to the map frame.
+    def _map_transform_at(self, query):
+        """Non-blocking optical->map transform (R, t) at the exact time `query`.
 
-        Uses the message stamp first (correct odometry pose for this frame) and
-        falls back to the latest available transform if that one is unavailable.
-        Returns (None, None) when no transform can be found.
+        Returns (None, None) if tf2 can't resolve that stamp yet (the surrounding
+        odometry poses haven't both arrived). No 'latest pose' fallback: the
+        caller waits for the real interpolated pose instead of using a
+        temporally-misaligned one.
         """
-        for query in (rclpy.time.Time.from_msg(stamp), rclpy.time.Time()):
-            try:
-                tf = self.tf_buffer.lookup_transform(
-                    self.map_frame, self.optical_frame_id, query
-                )
-            except TransformException:
-                continue
-            tr = np.array([
-                tf.transform.translation.x,
-                tf.transform.translation.y,
-                tf.transform.translation.z,
-            ])
-            q = [
-                tf.transform.rotation.x,
-                tf.transform.rotation.y,
-                tf.transform.rotation.z,
-                tf.transform.rotation.w,
-            ]
-            return Rotation.from_quat(q).as_matrix(), tr
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, self.optical_frame_id, query
+            )
+        except TransformException:
+            return None, None
+        tr = np.array([
+            tf.transform.translation.x,
+            tf.transform.translation.y,
+            tf.transform.translation.z,
+        ])
+        q = [
+            tf.transform.rotation.x,
+            tf.transform.rotation.y,
+            tf.transform.rotation.z,
+            tf.transform.rotation.w,
+        ]
+        return Rotation.from_quat(q).as_matrix(), tr
 
-        self.get_logger().warn(
-            f"No transform {self.map_frame} <- {self.optical_frame_id}; "
-            "global object map not updated.",
-            throttle_duration_sec=2.0,
-        )
-        return None, None
+    def _drain_pending(self):
+        """Resolve queued detections against their stamp's odometry pose.
 
-    def update_global_objects(self, object_list, detection_result, header, R, t):
-        """Transform localized objects into the map frame and fuse them in.
-
-        Reuses the optical->map transform (R, t) already looked up for this
-        frame; does nothing when it was unavailable.
+        Processes the queue in arrival (≈stamp) order. A frame whose pose isn't
+        available yet but is still younger than ``map_tf_max_wait`` is left in
+        place (we wait for the estimator to catch up) and, since the queue is
+        ordered, so is everything behind it. A frame that ages past that without
+        a pose is resolved anyway with no map position -- the detection is still
+        logged, never dropped.
         """
-        if not self.get_parameter("publish_global_objects").value:
+        if not self._pending:
             return
-        if R is None:
+        now = self.get_clock().now()
+        while self._pending:
+            rec = self._pending[0]
+            query = rclpy.time.Time.from_msg(rec["stamp"])
+            R, t = self._map_transform_at(query)
+            if R is None:
+                if (now - query) < self.map_tf_max_wait:
+                    break  # pose may still arrive; keep order, try again later
+                self.get_logger().warn(
+                    f"No {self.map_frame} <- {self.optical_frame_id} pose within "
+                    f"{self.map_tf_max_wait.nanoseconds / 1e9:.2f}s of the image "
+                    "stamp; logging the detection without a map position.",
+                    throttle_duration_sec=2.0,
+                )
+            self._pending.popleft()
+            self._resolve_frame(rec, R, t)
+
+    def _resolve_frame(self, rec, R, t):
+        """Log + fuse one frame's detections using its resolved pose (R, t).
+
+        R may be None (pose never arrived): detections are still logged, just
+        without a map-frame position, and global fusion is skipped.
+        """
+        stamp = rec["stamp"]
+        if self._det_logger is not None:
+            for it in rec["items"]:
+                point_map = (R @ it["point_cam"] + t) if R is not None else None
+                self._det_logger.log_detection(
+                    stamp=stamp,
+                    class_id=it["name"],
+                    confidence=it["confidence"],
+                    point_cam=it["point_cam"],
+                    bbox=it["bbox"],
+                    camera_frame=self.optical_frame_id,
+                    estimation_type=it["estimation_type"],
+                    point_map=point_map,
+                    map_frame=self.map_frame,
+                )
+        if R is not None:
+            self.update_global_objects(rec["items"], stamp, R, t)
+
+    def update_global_objects(self, items, stamp, R, t):
+        """Transform localized detections into the map frame and fuse them in."""
+        if not self.get_parameter("publish_global_objects").value:
             return
 
         merge_distance = self.get_parameter("object_merge_distance").value
-        for i, obj in enumerate(object_list):
+        for it in items:
             # Only fuse real lidar measurements; bbox-only distance estimates and
             # un-localized detections (z == -1) carry no reliable 3D position.
-            if obj.estimation_type != "measurement":
+            if it["estimation_type"] != "measurement":
                 continue
-
-            pos_optical = np.array(
-                [float(obj.pos[0]), float(obj.pos[1]), float(obj.pos[2])]
+            pos_map = R @ it["point_cam"] + t
+            self._merge_global_object(
+                it["name"], pos_map, it["confidence"], merge_distance
             )
-            pos_map = R @ pos_optical + t
-            name = str(detection_result["name"][i])
-            confidence = float(detection_result["confidence"][i])
-            self._merge_global_object(name, pos_map, confidence, merge_distance)
 
-        self._publish_global_objects(header.stamp)
+        self._publish_global_objects(stamp)
 
     def _merge_global_object(self, name, position, confidence, merge_distance):
         """Associate a detection with an existing best-guess or start a new one."""
@@ -797,6 +861,12 @@ class ObjectDetectionNode(Node):
             self._det_logger.write_global_objects(self.global_objects, stamp)
 
     def destroy_node(self):
+        # Flush anything still queued: resolve against the pose if it's there by
+        # now, otherwise log without a map position so no detection is lost.
+        while self._pending:
+            rec = self._pending.popleft()
+            R, t = self._map_transform_at(rclpy.time.Time.from_msg(rec["stamp"]))
+            self._resolve_frame(rec, R, t)
         if self._det_logger is not None:
             if self.global_objects:
                 self._det_logger.write_global_objects(self.global_objects, stamp=None)
