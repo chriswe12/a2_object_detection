@@ -89,6 +89,12 @@ class ObjectDetectionNode(Node):
                 ("object_detection_info_topic", "detection_info"),
                 ("image_annotations_topic", "detection_annotations"),
                 ("camera_lidar_sync_queue_size", 10),
+                # Max stamp difference (s) for the synchronizer to pair an image
+                # with a lidar scan. With a 5 Hz camera and 10 Hz lidar there is
+                # always a scan within ~0.05 s of each image, so 0.05 is the
+                # practical floor: lower starts dropping images that have no
+                # close-enough scan. The residual gap is removed by the
+                # motion-compensated lidar->camera lookup (see sync_callback).
                 ("camera_lidar_sync_slop", 0.05),
                 ("architecture", "yolo"),
                 ("task", ""),  # ""/"auto" -> infer from ONNX; "detect"/"segment" forces it
@@ -112,6 +118,11 @@ class ObjectDetectionNode(Node):
                 # --- global "best guess" object map (odometry-anchored) ---
                 ("publish_global_objects", True),
                 ("map_frame", "map"),
+                # Fixed (non-moving) frame the lidar->camera transform is routed
+                # through so ego-motion between the lidar scan time and the image
+                # exposure time is removed. Empty -> fall back to map_frame. Under
+                # RESPLE this is "map" (static-identity to "world").
+                ("lidar_camera_fixed_frame", ""),
                 # Map-frame fusion is deferred: each frame's detections are
                 # queued and resolved against the odometry pose at their *exact*
                 # stamp once it is available (tf2 interpolates between the two
@@ -163,6 +174,10 @@ class ObjectDetectionNode(Node):
 
         # Persistent best-guess object map, anchored in the odometry/map frame.
         self.map_frame = self.get_parameter("map_frame").value
+        # Fixed frame for motion-compensating the lidar->camera transform.
+        self.fixed_frame = (
+            self.get_parameter("lidar_camera_fixed_frame").value or self.map_frame
+        )
         self.global_marker_pub = self.create_publisher(
             MarkerArray, self.get_parameter("global_object_markers_topic").value, 10
         )
@@ -370,20 +385,19 @@ class ObjectDetectionNode(Node):
             #     point_cloud_xyz, self.get_parameter("ground_percentage").value
             # )
 
-            # Get transform from TF
-            try:
-                t = self.tf_buffer.lookup_transform(
-                    self.optical_frame_id,
-                    lidar_msg.header.frame_id,
-                    rclpy.time.Time()
-                )
-            except TransformException as ex:
-                self.get_logger().info(f'Could not transform points from {lidar_msg.header.frame_id} to {self.optical_frame_id}: {ex}', throttle_duration_sec=1.0)
+            # Get the lidar->camera transform. The lidar scan (lidar_msg.stamp)
+            # and the image (image_msg.stamp) are captured up to `slop` apart, so
+            # we route the lookup through a fixed frame to remove the robot's
+            # motion in that interval (the extrinsic is static, but the world has
+            # moved relative to the rig). Returns (None, None) if it can't be
+            # resolved even with the static fallback.
+            rotation_matrix, translation = self._lidar_to_camera_transform(
+                lidar_msg.header.frame_id,
+                lidar_msg.header.stamp,
+                image_msg.header.stamp,
+            )
+            if rotation_matrix is None:
                 return
-
-            translation = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
-            quaternion = [t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w]
-            rotation_matrix = Rotation.from_quat(quaternion).as_matrix()
 
             # Transform points
             transformed_points = np.dot(point_cloud_xyz[:, :3], rotation_matrix.T) + translation
@@ -681,6 +695,65 @@ class ObjectDetectionNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error in sync_callback: {str(e)}")
 
+
+    def _lidar_to_camera_transform(self, lidar_frame, lidar_stamp, image_stamp):
+        """Return (R, t) mapping lidar points (at scan time) into the camera
+        optical frame (at image time), compensated for ego-motion in between.
+
+        The lidar->camera extrinsic is static, but the lidar scan and the image
+        are captured at slightly different times; while the robot moves, the
+        world shifts relative to the rig in that interval. Routing the lookup
+        through ``self.fixed_frame`` (e.g. ``map``) at the two distinct stamps
+        removes that shift, so projected points land on the object as seen in the
+        image rather than where it was when the lidar swept it.
+
+        Falls back to the time-agnostic static extrinsic if the motion-
+        compensated lookup can't be resolved yet (e.g. odometry not yet covering
+        both stamps), so frames are never dropped for a missing pose. Returns
+        (None, None) only if even the static lookup fails.
+        """
+        t = None
+        try:
+            t = self.tf_buffer.lookup_transform_full(
+                self.optical_frame_id,
+                rclpy.time.Time.from_msg(image_stamp),
+                lidar_frame,
+                rclpy.time.Time.from_msg(lidar_stamp),
+                self.fixed_frame,
+            )
+        except TransformException as ex:
+            # Motion-compensated lookup unavailable: use the static extrinsic so
+            # we still publish, but warn since projection may smear during motion.
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    self.optical_frame_id, lidar_frame, rclpy.time.Time()
+                )
+            except TransformException as ex2:
+                self.get_logger().info(
+                    f"Could not transform points from {lidar_frame} to "
+                    f"{self.optical_frame_id}: {ex2}",
+                    throttle_duration_sec=1.0,
+                )
+                return None, None
+            self.get_logger().warn(
+                f"Motion-compensated lidar->camera lookup via '{self.fixed_frame}' "
+                f"unavailable ({ex}); using static extrinsic — projection may "
+                "smear while the robot moves.",
+                throttle_duration_sec=5.0,
+            )
+
+        translation = np.array([
+            t.transform.translation.x,
+            t.transform.translation.y,
+            t.transform.translation.z,
+        ])
+        quaternion = [
+            t.transform.rotation.x,
+            t.transform.rotation.y,
+            t.transform.rotation.z,
+            t.transform.rotation.w,
+        ]
+        return Rotation.from_quat(quaternion).as_matrix(), translation
 
     def _map_transform_at(self, query):
         """Non-blocking optical->map transform (R, t) at the exact time `query`.

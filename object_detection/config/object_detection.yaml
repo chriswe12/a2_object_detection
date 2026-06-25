@@ -21,7 +21,10 @@
     project_object_points_to_image: true
     project_all_points_to_image: false
     camera_lidar_sync_queue_size: 10
-    camera_lidar_sync_slop: 0.1
+    # 5 Hz camera + 10 Hz lidar => a scan is always within ~0.05 s of each image;
+    # 0.05 is the practical floor (lower drops images with no close scan). The
+    # residual gap is removed by the motion-compensated lidar->camera lookup.
+    camera_lidar_sync_slop: 0.05
 
     # --- ground filter ---
     ground_percentage: 25
